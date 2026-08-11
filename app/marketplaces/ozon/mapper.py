@@ -398,6 +398,37 @@ def _extract_location(nuxt: dict | None) -> OzonLocation:
         timezone=cur.get("timeZoneUtcname"),
     )
 
+def _extract_button_state(html: str, nuxt: dict | None) -> str:
+    """
+    Состояние товара по признакам страницы (надёжнее, чем гадать по ценам):
+      - in_cart      — есть виджет webAddToCart (кнопка «В корзину»), товар в наличии;
+      - out_of_stock — товара нет: webOutOfStock ИЛИ Ozon увёл на поиск
+                       (pageType != 'pdp') ИЛИ webSale отдал «Товар закончился»;
+      - not_found    — страницы не существует (ловится выше, в repository/parser);
+      - unknown      — ничего из перечисленного не распозналось.
+    """
+    # 1. Явный виджет «нет в наличии».
+    if 'state-webOutOfStock-' in html:
+        return "out_of_stock"
+
+    # 2. Ozon увёл со страницы товара на поиск аналогов: у живого pageType='pdp',
+    #    у закончившегося становится 'search'.
+    if nuxt:
+        page_type = (nuxt.get("layoutTrackingInfo", {}).get("pageType")
+                     or nuxt.get("pageInfo", {}).get("pageType"))
+        if page_type and page_type != "pdp":
+            return "out_of_stock"
+
+    # 3. Есть кнопка «В корзину» — товар в наличии.
+    if 'state-webAddToCart-' in html:
+        return "in_cart"
+
+    # 4. Подстраховка по тексту.
+    if 'Товар закончился' in html or 'товар быстро закончился' in html:
+        return "out_of_stock"
+
+    return "unknown"
+
 
 # ----------------------------------------------------------------------------- #
 #  Главная сборка                                                               #
@@ -415,6 +446,7 @@ def build_card(html: str, nuxt_state: dict | None, url: str | None = None) -> Oz
     rating, reviews = _extract_rating_reviews(html, nuxt_state)
     category, category_path = _extract_category(nuxt_state)
     variants_aspect, variants = _extract_variants(html)
+    button_state = _extract_button_state(html, nuxt_state)
 
     card = OzonCard(
         sku=sku,
@@ -434,5 +466,6 @@ def build_card(html: str, nuxt_state: dict | None, url: str | None = None) -> Oz
         variants=variants,
         seller=_extract_seller(html),
         location=_extract_location(nuxt_state),
+        button_state=button_state,
     )
     return card

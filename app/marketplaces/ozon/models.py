@@ -93,3 +93,8 @@ class OzonCard(BaseModel):
 
     # Регион выдачи (город/страна, в контексте которых отданы цены и наличие)
     location: OzonLocation = Field(default_factory=OzonLocation)
+
+    # Состояние товара по признакам страницы:
+    # in_cart — «В корзину» (в наличии); out_of_stock — нет в наличии;
+    # not_found — страницы не существует; unknown — не распозналось.
+    button_state: str | None = Field(None, description="Состояние кнопки покупки")
