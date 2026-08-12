@@ -246,6 +246,22 @@ def seller_is_free(seller_id: str | None, taken_seller_ids: set[str],
     return True
 
 
+def _reviews_to_int(value) -> int | None:
+    """Безопасно привести reviews_count карточки (строка '103', None, мусор) к int."""
+    if value is None:
+        return None
+    digits = re.sub(r"\D", "", str(value))
+    return int(digits) if digits else None
+
+
+def _rating_to_float(value) -> float | None:
+    """Безопасно привести rating карточки (строка '4.9', None) к float."""
+    if value is None:
+        return None
+    m = re.search(r"\d+(?:[.,]\d+)?", str(value))
+    return float(m.group(0).replace(",", ".")) if m else None
+
+
 def select_cards(
     req: StratumRequest,
     fetch_page,          # callable: (url|None) -> {"html","url","next_page"}
@@ -298,14 +314,29 @@ def select_cards(
 
             logger.info("Захожу в карточку sku=%s (%s)", c.sku, c.url)
             try:
-                card = get_card(c.url)          # переиспуемый путь card/by-url
+                card = get_card(c.url)  # переиспуемый путь card/by-url
             except AntibotBlockedError:
-                raise                            # блок пробрасываем как есть
+                raise  # блок пробрасываем как есть
             except Exception as e:
                 logger.warning("sku=%s: карточку получить не удалось (%s) — пропуск", c.sku, e)
                 continue
 
+            # Финальная проверка порога по данным карточки. В выдаче
+            # рейтинг/отзывы бывают суммарными по нескольким карточкам. Порог тот же: отзывы
+            # строго больше min_reviews, рейтинг не ниже min_rating.
+            card_reviews = _reviews_to_int(card.reviews_count)
+            card_rating = _rating_to_float(card.rating)
+            if card_reviews is None or card_reviews <= min_reviews:
+                logger.info("sku=%s: отзывов %s (нужно > %s) — пропуск по карточке",
+                            c.sku, card_reviews, min_reviews)
+                continue
+            if card_rating is None or card_rating < min_rating:
+                logger.info("sku=%s: рейтинг %s (нужно >= %s) — пропуск по карточке",
+                            c.sku, card_rating, min_rating)
+                continue
+
             seller_id = card.seller.id if card.seller else None
+
             if not seller_is_free(seller_id, taken_sellers, sku=c.sku):
                 continue
 
