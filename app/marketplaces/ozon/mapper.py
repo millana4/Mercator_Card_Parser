@@ -446,7 +446,10 @@ def build_card(html: str, nuxt_state: dict | None, url: str | None = None) -> Oz
     rating, reviews = _extract_rating_reviews(html, nuxt_state)
     category, category_path = _extract_category(nuxt_state)
     variants_aspect, variants = _extract_variants(html)
-    button_state = _extract_button_state(html, nuxt_state)
+    if 'data-widget="error"' in html or "Такой страницы не существует" in html:
+        button_state = "not_found"
+    else:
+        button_state = _extract_button_state(html, nuxt_state)
 
     card = OzonCard(
         sku=sku,

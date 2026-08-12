@@ -39,7 +39,7 @@ def handle_select(task: dict, service: OzonService) -> dict:
         return {
             **echo, "ok": False,
             "requested_count": task.get("count"), "found_count": 0,
-            "cards": [], "error": _error_text(e),
+            "cards": [], "error": _error_text(e), "error_code": _error_code(e),
         }
 
 
@@ -55,13 +55,15 @@ def handle_parse(task: dict, service: OzonService) -> dict:
     sku = task.get("sku")
     if not sku:
         logger.warning("PARSE задача без sku | task_id=%s", echo["task_id"])
-        return {**echo, "ok": False, "card": None, "error": "В задаче отсутствует sku"}
+        return {**echo, "ok": False, "card": None,
+                "error": "В задаче отсутствует sku", "error_code": "invalid_request"}
     try:
         result = service.get_card_by_id(str(sku))
         return {**echo, "ok": True, "card": result["card"], "error": None}
     except Exception as e:
         logger.exception("PARSE задача провалилась | task_id=%s sku=%s", echo["task_id"], sku)
-        return {**echo, "ok": False, "card": None, "error": _error_text(e)}
+        return {**echo, "ok": False, "card": None,
+                "error": _error_text(e), "error_code": _error_code(e)}
 
 
 def _build_stratum_request(task: dict) -> StratumRequest:
@@ -91,3 +93,12 @@ def _error_text(e: Exception) -> str:
     if isinstance(e, InvalidRequestError):
         return f"Некорректный запрос: {e}"
     return f"{type(e).__name__}: {e}"
+
+def _error_code(e: Exception) -> str:
+    if isinstance(e, AntibotBlockedError):
+        return "antibot_blocked"
+    if isinstance(e, ProductNotFoundError):
+        return "product_not_found"
+    if isinstance(e, InvalidRequestError):
+        return "invalid_request"
+    return "internal_error"

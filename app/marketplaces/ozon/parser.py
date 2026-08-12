@@ -129,6 +129,17 @@ class OzonParser:
                 continue
         return False
 
+    def _is_not_found(self) -> bool:
+        """Страница удалённого товара: Ozon отдаёт «Такой страницы не существует»
+        (виджет data-widget="error"). Это НЕ блок и НЕ 'нет в наличии' —
+        карточка удалена. Проверяем дёшево по page_source, без XPath-ретраев."""
+        try:
+            src = self.driver.page_source
+        except Exception:
+            return False
+        return ('data-widget="error"' in src
+                or "Такой страницы не существует" in src)
+
     def fetch_html(self, url: str) -> str:
         """
         Открыть карточку с ретраями и вернуть HTML.
@@ -146,6 +157,10 @@ class OzonParser:
                 self.driver.get(url)
             except Exception as e:
                 logger.warning("Ошибка загрузки страницы: %s", e)
+
+            if self._is_not_found():
+                logger.info("Карточка удалена (Такой страницы не существует): %s", url)
+                return self.driver.page_source
 
             if self._is_blocked():
                 last_blocked = True

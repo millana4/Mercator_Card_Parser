@@ -55,9 +55,17 @@ class OzonRepository:
         parser = OzonParser(self.policy)
         try:
             html = parser.fetch_html(url)
-            nuxt = extract_nuxt_state(html)
+            not_found = ('data-widget="error"' in html
+                         or "Такой страницы не существует" in html)
+            nuxt = {} if not_found else extract_nuxt_state(html)
             png = parser.screenshot_png()
-            return {"html": html, "nuxt_state": nuxt, "screenshot_png": png, "url": url}
+            return {
+                "html": html,
+                "nuxt_state": nuxt,
+                "screenshot_png": png,
+                "url": url,
+                "not_found": not_found,
+            }
         finally:
             parser.close()
 
