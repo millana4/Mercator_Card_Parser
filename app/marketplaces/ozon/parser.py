@@ -111,6 +111,29 @@ class OzonParser:
 
     def _is_blocked(self) -> bool:
         """Признаки капчи/блокировки на странице."""
+        # Быстрая проверка по исходнику/URL/заголовку — ловит новую капчу
+        # Ozon ('Antibot Captcha', редирект ?__rr=1), которую XPath ниже не видит.
+        try:
+            src = self.driver.page_source
+        except Exception:
+            src = ""
+        try:
+            title = (self.driver.title or "")
+        except Exception:
+            title = ""
+        try:
+            cur_url = (self.driver.current_url or "")
+        except Exception:
+            cur_url = ""
+        text_markers = ["Antibot Captcha", "antibot", "captcha", "px-captcha"]
+        low_src = src.lower()
+        if ("antibot captcha" in title.lower()
+                or "__rr=1" in cur_url
+                or any(mk.lower() in low_src for mk in text_markers)):
+            logger.warning("Обнаружена капча/блокировка (title=%r, url=%r)", title, cur_url)
+            return True
+
+        # Старые XPath-маркеры (на случай других страниц блокировки).
         markers = [
             "//h1[contains(text(), 'Доступ ограничен')]",
             "//h1[contains(text(), 'Ой!')]",

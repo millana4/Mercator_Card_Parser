@@ -9,6 +9,7 @@ consumer.py — цикл потребления задач.
 import json
 import time
 import signal
+import random
 from kafka import KafkaConsumer, TopicPartition, OffsetAndMetadata
 from kafka.errors import NoBrokersAvailable, KafkaError
 
@@ -28,6 +29,8 @@ class TaskConsumer:
         self.producer = ResultProducer()
         self.consumer = None            # подключим в run(), с повторами
         self._running = True
+        self._antibot_streak = 0  # блокировок подряд
+        self._policy = self.service.policy  # политика с параметрами пауз
 
     def stop(self, *_):
         logger.info("Сигнал остановки — завершаю после текущей задачи")
@@ -123,8 +126,41 @@ class TaskConsumer:
         except Exception:
             logger.error("Результат не отправлен — смещение НЕ коммичу, задача перечитается")
             return
-
         self._commit(message)
+
+        # Реакция на антибот: считаем блокировки подряд, при полосе — cooldown.
+        if topic == kws.parse_tasks_topic:
+            self._react_to_antibot(result)
+        # Небольшая пауза между карточками.
+        self._pause_between_cards()
+
+    def _react_to_antibot(self, result: dict) -> None:
+        """Считает блокировки подряд. При полосе — длинный сон, чтобы остудить защиту."""
+        if result.get("error_code") == "antibot_blocked":
+            self._antibot_streak += 1
+            logger.warning("Антибот подряд: %s/%s",
+                           self._antibot_streak,
+                           self._policy.antibot_streak_threshold)
+            if self._antibot_streak >= self._policy.antibot_streak_threshold:
+                cooldown = self._policy.antibot_cooldown_s
+                logger.warning("Полоса блокировок — пауза воркера на %s сек", cooldown)
+                self._interruptible_sleep(cooldown)
+                self._antibot_streak = 0
+        else:
+            # любой не-антибот результат (успех/др. ошибка) сбрасывает серию
+            self._antibot_streak = 0
+
+    def _pause_between_cards(self) -> None:
+        """Случайная пауза между карточками."""
+        delay = random.uniform(self._policy.between_cards_min,
+                               self._policy.between_cards_max)
+        self._interruptible_sleep(delay)
+
+    def _interruptible_sleep(self, seconds: float) -> None:
+        """Спит, но просыпается на остановку воркера (не блокирует SIGTERM надолго)."""
+        end = time.time() + seconds
+        while self._running and time.time() < end:
+            time.sleep(min(2.0, end - time.time()))
 
     def _commit(self, message) -> None:
         tp = TopicPartition(message.topic, message.partition)

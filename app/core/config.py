@@ -17,14 +17,19 @@ class MarketplacePolicy(BaseSettings):
     Политика парсинга одного маркетплейса: таймауты, паузы, ретраи.
     Заполняется из общих дефолтов и переопределяется env-переменными.
     """
-    headless: bool = True
+    headless: bool = False
     page_load_timeout: int = 30          # сек, set_page_load_timeout
     wait_timeout: int = 15               # сек, ожидание появления данных на странице
-    pause_min: float = 2.0               # мин. пауза между действиями (антибот)
-    pause_max: float = 4.0               # макс. пауза между действиями
+    pause_min: float = 3.0               # мин. пауза между действиями (антибот)
+    pause_max: float = 6.0               # макс. пауза между действиями
     retries: int = 3                     # число попыток при блокировке/ошибке
     retry_pause_min: float = 20.0        # пауза между попытками, мин
     retry_pause_max: float = 40.0        # пауза между попытками, макс
+    # Темп воркера и реакция на серию блокировок
+    between_cards_min: float = 3.0       # пауза между карточками, мин
+    between_cards_max: float = 7.0       # пауза между карточками, макс
+    antibot_streak_threshold: int = 3    # сколько блокировок подряд = «полоса»
+    antibot_cooldown_s: int = 600        # сон воркера при полосе, сек (10 мин)
     # Пороги отбора карточек при подборе
     min_rating: float = 4.8  # минимальный рейтинг кандидата
     min_reviews: int = 100  # минимальное число отзывов (строго больше)
@@ -59,14 +64,18 @@ class Settings(BaseSettings):
 
     # --- Политики маркетплейсов ---
     # Ozon: можно переопределить через env OZON_HEADLESS, OZON_RETRIES и т.д.
-    ozon_headless: bool = Field(default=True, alias="OZON_HEADLESS")
+    ozon_headless: bool = Field(default=False, alias="OZON_HEADLESS")
     ozon_page_load_timeout: int = Field(default=30, alias="OZON_PAGE_LOAD_TIMEOUT")
     ozon_wait_timeout: int = Field(default=15, alias="OZON_WAIT_TIMEOUT")
-    ozon_pause_min: float = Field(default=2.0, alias="OZON_PAUSE_MIN")
-    ozon_pause_max: float = Field(default=4.0, alias="OZON_PAUSE_MAX")
+    ozon_pause_min: float = Field(default=3.0, alias="OZON_PAUSE_MIN")
+    ozon_pause_max: float = Field(default=6.0, alias="OZON_PAUSE_MAX")
     ozon_retries: int = Field(default=3, alias="OZON_RETRIES")
     ozon_retry_pause_min: float = Field(default=20.0, alias="OZON_RETRY_PAUSE_MIN")
     ozon_retry_pause_max: float = Field(default=40.0, alias="OZON_RETRY_PAUSE_MAX")
+    ozon_between_cards_min: float = Field(default=3.0, alias="OZON_BETWEEN_CARDS_MIN")
+    ozon_between_cards_max: float = Field(default=7.0, alias="OZON_BETWEEN_CARDS_MAX")
+    ozon_antibot_streak_threshold: int = Field(default=3, alias="OZON_ANTIBOT_STREAK_THRESHOLD")
+    ozon_antibot_cooldown_s: int = Field(default=600, alias="OZON_ANTIBOT_COOLDOWN_S")
     ozon_min_rating: float = Field(default=4.8, alias="OZON_MIN_RATING")
     ozon_min_reviews: int = Field(default=100, alias="OZON_MIN_REVIEWS")
     ozon_pool_multiplier: int = Field(default=3, alias="OZON_POOL_MULTIPLIER")
@@ -84,6 +93,10 @@ class Settings(BaseSettings):
             retries=self.ozon_retries,
             retry_pause_min=self.ozon_retry_pause_min,
             retry_pause_max=self.ozon_retry_pause_max,
+            between_cards_min=self.ozon_between_cards_min,
+            between_cards_max=self.ozon_between_cards_max,
+            antibot_streak_threshold=self.ozon_antibot_streak_threshold,
+            antibot_cooldown_s=self.ozon_antibot_cooldown_s,
             min_rating=self.ozon_min_rating,
             min_reviews=self.ozon_min_reviews,
             pool_multiplier=self.ozon_pool_multiplier,
