@@ -16,6 +16,7 @@ import time
 import random
 import shutil
 import tempfile
+import os
 
 from selenium import webdriver
 from selenium.webdriver.common.by import By
@@ -41,8 +42,19 @@ class OzonParser:
         self.policy = policy
         self.driver = None
         self.wait = None
-        self.chrome_temp_dir = tempfile.mkdtemp()
-        logger.debug("OzonParser.__init__: профиль Chrome=%s", self.chrome_temp_dir)
+        # Постоянный профиль (том): кука-пропуск антибота переживает карточки и
+        # рестарты. Если путь не задан — временный профиль.
+        persistent = os.environ.get("OZON_CHROME_PROFILE_DIR")
+        if persistent:
+            os.makedirs(persistent, exist_ok=True)
+            self.chrome_temp_dir = persistent
+            self._profile_is_temp = False
+            self._clear_stale_locks(persistent)
+        else:
+            self.chrome_temp_dir = tempfile.mkdtemp()
+            self._profile_is_temp = True
+        logger.debug("OzonParser.__init__: профиль Chrome=%s (temp=%s)",
+                     self.chrome_temp_dir, self._profile_is_temp)
         try:
             self._setup_driver()
             self.wait = WebDriverWait(self.driver, policy.wait_timeout)
@@ -50,6 +62,19 @@ class OzonParser:
             logger.error("Ошибка инициализации драйвера", exc_info=True)
             self.close()
             raise
+
+    # ------------------------------------------------------------------ #
+    @staticmethod
+    def _clear_stale_locks(profile_dir: str) -> None:
+        """Убрать залипшие Chrome-локи от некорректно закрытого прошлого запуска
+        иначе новый Chrome не стартует на том же профиле."""
+        for name in ("SingletonLock", "SingletonCookie", "SingletonSocket"):
+            path = os.path.join(profile_dir, name)
+            try:
+                if os.path.islink(path) or os.path.exists(path):
+                    os.remove(path)
+            except Exception as e:
+                logger.debug("Не удалось убрать лок %s: %s", path, e)
 
     # ------------------------------------------------------------------ #
     def _setup_driver(self):
@@ -232,16 +257,18 @@ class OzonParser:
             return None
 
     def close(self):
-        """Закрыть драйвер и удалить временный профиль."""
+        """Закрыть драйвер. Постоянный профиль сохраняем (кука антибота),
+        временный — удаляем."""
         if self.driver:
             try:
                 self.driver.quit()
             except Exception as e:
                 logger.debug("Ошибка quit(): %s", e)
             self.driver = None
-        if self.chrome_temp_dir:
+        if getattr(self, "_profile_is_temp", True) and self.chrome_temp_dir:
             shutil.rmtree(self.chrome_temp_dir, ignore_errors=True)
-        logger.debug("OzonParser.close: ресурсы освобождены")
+        logger.debug("OzonParser.close: ресурсы освобождены (temp=%s)",
+                     getattr(self, "_profile_is_temp", True))
 
     def fetch_listing_html(self, url: str) -> str:
         """Открыть одну страницу выдачи, вернуть HTML. Без скролла — пагинация

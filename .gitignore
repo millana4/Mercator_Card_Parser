@@ -18,3 +18,4 @@ venv/
 .DS_Store
 *.log
 .pytest_cache/
+app/chrome-profile/

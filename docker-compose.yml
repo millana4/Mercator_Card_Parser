@@ -8,8 +8,10 @@ services:
       - .env
     environment:
       - TZ=Europe/Moscow
+      - OZON_CHROME_PROFILE_DIR=/app/chrome-profile
     volumes:
       - ./app/debug:/app/app/debug
+      - ./app/chrome-profile:/app/chrome-profile
     extra_hosts:
       - "host.docker.internal:host-gateway"
     restart: unless-stopped
@@ -22,8 +24,10 @@ services:
       - .env
     environment:
       - TZ=Europe/Moscow
+      - OZON_CHROME_PROFILE_DIR=/app/chrome-profile
     volumes:
       - ./app/debug:/app/app/debug
+      - ./app/chrome-profile:/app/chrome-profile
     extra_hosts:
       - "host.docker.internal:host-gateway"
     restart: unless-stopped
