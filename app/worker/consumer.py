@@ -98,6 +98,10 @@ class TaskConsumer:
     def _consume_loop(self):
         """Внутренний цикл: пока связь есть и нас не остановили."""
         while self._running:
+            if self.consumer is None:
+                # consumer закрыт (например, cooldown-выход из группы) —
+                # выходим во внешний цикл run(), он переподключит.
+                return
             batch = self.consumer.poll(timeout_ms=kws.poll_timeout_ms)
             if not batch:
                 continue
@@ -106,6 +110,9 @@ class TaskConsumer:
                     if not self._running:
                         return
                     self._process_one(tp.topic, message)
+                    if self.consumer is None:
+                        # cooldown-выход произошёл внутри обработки — выходим.
+                        return
 
     def _process_one(self, topic: str, message) -> None:
         task = message.value
@@ -136,20 +143,41 @@ class TaskConsumer:
         self._pause_between_cards()
 
     def _react_to_antibot(self, result: dict) -> None:
-        """Считает блокировки подряд. При полосе — длинный сон, чтобы остудить защиту."""
+        """Считает блокировки подряд. При полосе — воркер ВЫХОДИТ из группы на
+        время cooldown: закрывает consumer, чтобы Kafka отдала его партицию
+        живым парсерам (rebalance), спит, затем внешний цикл run() переподключит.
+        Так забаненный IP не держит партицию — карточки уходят живым."""
         if result.get("error_code") == "antibot_blocked":
             self._antibot_streak += 1
             logger.warning("Антибот подряд: %s/%s",
                            self._antibot_streak,
                            self._policy.antibot_streak_threshold)
             if self._antibot_streak >= self._policy.antibot_streak_threshold:
-                cooldown = self._policy.antibot_cooldown_s
-                logger.warning("Полоса блокировок — пауза воркера на %s сек", cooldown)
-                self._interruptible_sleep(cooldown)
                 self._antibot_streak = 0
+                self._cooldown_release_partition()
         else:
             # любой не-антибот результат (успех/др. ошибка) сбрасывает серию
             self._antibot_streak = 0
+
+    def _cooldown_release_partition(self) -> None:
+        """Выйти из группы (освободить партицию живым), поспать cooldown,
+        закрыть браузер сессии, затем пометить consumer как отсутствующий —
+        внешний цикл run() переподключит воркер обратно в группу."""
+        cooldown = self._policy.antibot_cooldown_s
+        logger.warning("Полоса блокировок — выхожу из группы, партиция уйдёт "
+                       "живым парсерам; cooldown %s сек", cooldown)
+        # 1. Закрыть consumer → Kafka сделает rebalance, партиция уйдёт живым.
+        self._close_consumer()
+        self.consumer = None
+        # 2. Закрыть браузер сессии (IP забанен, сессия всё равно мертва).
+        try:
+            self.service.close_crawl()
+        except Exception as e:
+            logger.debug("Ошибка закрытия сессии при cooldown: %s", e)
+        # 3. Отсидеть cooldown (IP остывает), прерываемо на остановку воркера.
+        self._interruptible_sleep(cooldown)
+        logger.info("Cooldown окончен — переподключаюсь к группе")
+        # consumer=None → внешний цикл run() вызовет _connect_consumer заново.
 
     def _pause_between_cards(self) -> None:
         """Пауза между карточками. Для reserve-парсера — щадящая (~1 обход/сутки),
