@@ -53,6 +53,7 @@ class TaskConsumer:
                     max_poll_interval_ms=1800000,
                     session_timeout_ms=60000,
                     heartbeat_interval_ms=20000,
+                    **kws.kafka_auth_kwargs,
                 )
                 logger.info("TaskConsumer подписан на %s | group=%s | brokers=%s (попытка %s)",
                             kws.task_topics, kws.group_id, kws.bootstrap_servers, attempt)
@@ -151,9 +152,15 @@ class TaskConsumer:
             self._antibot_streak = 0
 
     def _pause_between_cards(self) -> None:
-        """Случайная пауза между карточками."""
-        delay = random.uniform(self._policy.between_cards_min,
-                               self._policy.between_cards_max)
+        """Пауза между карточками. Для reserve-парсера — щадящая (~1 обход/сутки),
+        для primary — обычная."""
+        if kws.role == "reserve":
+            lo, hi = (self._policy.reserve_between_cards_min,
+                      self._policy.reserve_between_cards_max)
+        else:
+            lo, hi = (self._policy.between_cards_min,
+                      self._policy.between_cards_max)
+        delay = random.uniform(lo, hi)
         self._interruptible_sleep(delay)
 
     def _interruptible_sleep(self, seconds: float) -> None:

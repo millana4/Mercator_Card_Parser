@@ -26,8 +26,12 @@ class MarketplacePolicy(BaseSettings):
     retry_pause_min: float = 20.0        # пауза между попытками, мин
     retry_pause_max: float = 40.0        # пауза между попытками, макс
     # Темп воркера и реакция на серию блокировок
-    between_cards_min: float = 3.0       # пауза между карточками, мин
-    between_cards_max: float = 7.0       # пауза между карточками, макс
+    between_cards_min: float = 12.0  # пауза между карточками (primary), мин
+    between_cards_max: float = 18.0  # пауза между карточками (primary), макс
+    # Щадящий темп запасного парсера (reserve): ~1 полный обход 323 карточек/сутки.
+    # 24ч / 323 ≈ 267с на карточку; диапазон вокруг для случайности.
+    reserve_between_cards_min: float = 240.0
+    reserve_between_cards_max: float = 300.0
     antibot_streak_threshold: int = 3    # сколько блокировок подряд = «полоса»
     antibot_cooldown_s: int = 600        # сон воркера при полосе, сек (10 мин)
     # Количество карточек в сессии браузера
@@ -75,8 +79,10 @@ class Settings(BaseSettings):
     ozon_retries: int = Field(default=3, alias="OZON_RETRIES")
     ozon_retry_pause_min: float = Field(default=20.0, alias="OZON_RETRY_PAUSE_MIN")
     ozon_retry_pause_max: float = Field(default=40.0, alias="OZON_RETRY_PAUSE_MAX")
-    ozon_between_cards_min: float = Field(default=3.0, alias="OZON_BETWEEN_CARDS_MIN")
-    ozon_between_cards_max: float = Field(default=7.0, alias="OZON_BETWEEN_CARDS_MAX")
+    ozon_between_cards_min: float = Field(default=12.0, alias="OZON_BETWEEN_CARDS_MIN")
+    ozon_between_cards_max: float = Field(default=18.0, alias="OZON_BETWEEN_CARDS_MAX")
+    ozon_reserve_between_cards_min: float = Field(default=240.0, alias="OZON_RESERVE_BETWEEN_CARDS_MIN")
+    ozon_reserve_between_cards_max: float = Field(default=300.0, alias="OZON_RESERVE_BETWEEN_CARDS_MAX")
     ozon_antibot_streak_threshold: int = Field(default=3, alias="OZON_ANTIBOT_STREAK_THRESHOLD")
     ozon_antibot_cooldown_s: int = Field(default=600, alias="OZON_ANTIBOT_COOLDOWN_S")
     ozon_session_min: int = Field(default=10, alias="OZON_SESSION_MIN")
@@ -100,6 +106,8 @@ class Settings(BaseSettings):
             retry_pause_max=self.ozon_retry_pause_max,
             between_cards_min=self.ozon_between_cards_min,
             between_cards_max=self.ozon_between_cards_max,
+            reserve_between_cards_min=self.ozon_reserve_between_cards_min,
+            reserve_between_cards_max=self.ozon_reserve_between_cards_max,
             antibot_streak_threshold=self.ozon_antibot_streak_threshold,
             antibot_cooldown_s=self.ozon_antibot_cooldown_s,
             session_min=self.ozon_session_min,

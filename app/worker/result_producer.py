@@ -31,6 +31,7 @@ class ResultProducer:
                     value_serializer=lambda v: json.dumps(v, ensure_ascii=False).encode("utf-8"),
                     acks="all",
                     retries=3,
+                    **kws.kafka_auth_kwargs,
                 )
                 logger.info("ResultProducer подключён к %s (попытка %s)",
                             kws.bootstrap_servers, attempt)

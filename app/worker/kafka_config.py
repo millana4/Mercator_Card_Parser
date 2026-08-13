@@ -20,6 +20,33 @@ class KafkaWorkerSettings(BaseSettings):
     poll_timeout_ms: int = Field(default=1000, alias="KAFKA_POLL_TIMEOUT_MS")
     reconnect_delay_s: int = Field(default=5, alias="KAFKA_RECONNECT_DELAY_S")
 
+    # Роль парсера: primary, быстрый темп, ~12 обходов или
+    # reserve, щадящий темп, 1 обход/сут, бережёт последний рабочий IP.
+    role: str = Field(default="primary", alias="PARSER_ROLE")
+
+    # SASL-авторизация к Kafka сервера (для парсеров на других машинах).
+    # Пусто = без авторизации (локальная разработка).
+    sasl_mechanism: str = Field(default="", alias="KAFKA_SASL_MECHANISM")
+    sasl_username: str = Field(default="", alias="KAFKA_SASL_USERNAME")
+    sasl_password: str = Field(default="", alias="KAFKA_SASL_PASSWORD")
+    security_protocol: str = Field(default="PLAINTEXT", alias="KAFKA_SECURITY_PROTOCOL")
+
+    @property
+    def sasl_enabled(self) -> bool:
+        return bool(self.sasl_username and self.sasl_password)
+
+    @property
+    def kafka_auth_kwargs(self) -> dict:
+        """Доп. аргументы подключения для kafka-python: SASL, если задан."""
+        if not self.sasl_enabled:
+            return {}
+        return {
+            "security_protocol": self.security_protocol or "SASL_PLAINTEXT",
+            "sasl_mechanism": self.sasl_mechanism or "PLAIN",
+            "sasl_plain_username": self.sasl_username,
+            "sasl_plain_password": self.sasl_password,
+        }
+
     @property
     def select_tasks_topic(self) -> str:
         return f"select.tasks.{self.geo_code}"
