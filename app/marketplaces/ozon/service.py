@@ -22,6 +22,8 @@ from app.core.logging import get_logger
 from app.marketplaces.ozon.repository import OzonRepository
 from app.marketplaces.ozon.mapper import build_card
 from app.marketplaces.ozon.selection import select_cards
+from app.marketplaces.ozon.repository import OzonRepository
+from app.marketplaces.ozon.parser import OzonParser
 from app.shared.kafka_logger import emit_event
 
 logger = get_logger(__name__)
@@ -31,6 +33,7 @@ class OzonService:
     def __init__(self, policy: MarketplacePolicy | None = None):
         self.policy = policy or settings.ozon_policy()
         self.repo = OzonRepository(self.policy)
+        self._crawl_parser = None  # долгоживущий парсер для сессии
 
     # ------------------------------------------------------------------ #
     def _basename(self, url: str) -> str:
@@ -112,6 +115,66 @@ class OzonService:
 
     def get_raw_by_id(self, sku: str) -> dict:
         return self.get_raw(OzonRepository.url_from_sku(sku))
+
+    # ================= Обход с долгоживущей сессией (воркер) ================= #
+    def _ensure_crawl_session(self) -> None:
+        """Гарантировать живой парсер с активной сессией. Создаёт браузер и
+        начинает сессию, если его нет или сессия исчерпана."""
+        if self._crawl_parser is not None and not self._crawl_parser.session_exhausted():
+            return
+        # Старую сессию (исчерпанную) закрываем.
+        self._close_crawl_session()
+        logger.info("Создаю новую сессию обхода")
+        self._crawl_parser = OzonParser(self.policy)
+        self._crawl_parser.begin_session()
+
+    def _close_crawl_session(self) -> None:
+        """Закрыть текущий парсер обхода (при исчерпании сессии или бане)."""
+        if self._crawl_parser is not None:
+            try:
+                self._crawl_parser.close()
+            except Exception as e:
+                logger.debug("Ошибка закрытия сессии обхода: %s", e)
+            self._crawl_parser = None
+
+    def get_card_for_crawl(self, url: str) -> dict:
+        """Разобрать карточку в рамках долгоживущей сессии (путь ОБХОДА).
+        Управляет сессией: заводит браузер, считает переходы, пересоздаёт по
+        исчерпании. При антиботе закрывает сессию и пробрасывает исключение —
+        воркер уйдёт в cooldown. HTTP-путь (get_card) не затрагивается."""
+        t0 = time.monotonic()
+        logger.info("get_card_for_crawl: старт, url=%s", url)
+        self._ensure_crawl_session()
+        parser = self._crawl_parser
+        try:
+            html = parser.fetch_html_in_session(url)
+        except AntibotBlockedError as exc:
+            self._emit_blocked(url, exc)
+            self._close_crawl_session()  # бан прерывает всю сессию
+            raise
+        finally:
+            # Переход израсходован в любом случае (даже при 404).
+            if parser is not None:
+                parser.consume_session_step()
+
+        not_found = ('data-widget="error"' in html
+                     or "Такой страницы не существует" in html)
+        nuxt = {} if not_found else parser.extract_nuxt_state(html)
+        card = build_card(html, nuxt, url)
+        card_dict = card.model_dump()
+        took = round(time.monotonic() - t0, 2)
+        emit_event("ozon.card.parsed",
+                   {"url": url, "sku": card.sku, "took_s": took, "crawl": True})
+        logger.info("get_card_for_crawl: готово за %sс, sku=%s, сессия_осталось=%s",
+                    took, card.sku, parser._session_left if parser else "-")
+        return {"card": card_dict, "debug_files": None}
+
+    def get_card_for_crawl_by_id(self, sku: str) -> dict:
+        return self.get_card_for_crawl(OzonRepository.url_from_sku(sku))
+
+    def close_crawl(self) -> None:
+        """Публичное закрытие сессии обхода (для остановки воркера)."""
+        self._close_crawl_session()
 
     # ------------------------------------------------------------------ #
     def _emit_blocked(self, url: str, exc: AntibotBlockedError) -> None:

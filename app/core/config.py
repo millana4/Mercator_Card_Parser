@@ -30,6 +30,9 @@ class MarketplacePolicy(BaseSettings):
     between_cards_max: float = 7.0       # пауза между карточками, макс
     antibot_streak_threshold: int = 3    # сколько блокировок подряд = «полоса»
     antibot_cooldown_s: int = 600        # сон воркера при полосе, сек (10 мин)
+    # Количество карточек в сессии браузера
+    session_min: int = 10
+    session_max: int = 50
     # Пороги отбора карточек при подборе
     min_rating: float = 4.8  # минимальный рейтинг кандидата
     min_reviews: int = 100  # минимальное число отзывов (строго больше)
@@ -76,6 +79,8 @@ class Settings(BaseSettings):
     ozon_between_cards_max: float = Field(default=7.0, alias="OZON_BETWEEN_CARDS_MAX")
     ozon_antibot_streak_threshold: int = Field(default=3, alias="OZON_ANTIBOT_STREAK_THRESHOLD")
     ozon_antibot_cooldown_s: int = Field(default=600, alias="OZON_ANTIBOT_COOLDOWN_S")
+    ozon_session_min: int = Field(default=10, alias="OZON_SESSION_MIN")
+    ozon_session_max: int = Field(default=50, alias="OZON_SESSION_MAX")
     ozon_min_rating: float = Field(default=4.8, alias="OZON_MIN_RATING")
     ozon_min_reviews: int = Field(default=100, alias="OZON_MIN_REVIEWS")
     ozon_pool_multiplier: int = Field(default=3, alias="OZON_POOL_MULTIPLIER")
@@ -97,6 +102,8 @@ class Settings(BaseSettings):
             between_cards_max=self.ozon_between_cards_max,
             antibot_streak_threshold=self.ozon_antibot_streak_threshold,
             antibot_cooldown_s=self.ozon_antibot_cooldown_s,
+            session_min=self.ozon_session_min,
+            session_max=self.ozon_session_max,
             min_rating=self.ozon_min_rating,
             min_reviews=self.ozon_min_reviews,
             pool_multiplier=self.ozon_pool_multiplier,

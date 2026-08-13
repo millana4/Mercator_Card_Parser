@@ -176,5 +176,9 @@ class TaskConsumer:
     def _shutdown(self):
         logger.info("Останавливаю воркер...")
         self._close_consumer()
+        try:
+            self.service.close_crawl()   # закрыть живой браузер сессии обхода
+        except Exception as e:
+            logger.debug("Ошибка закрытия сессии обхода: %s", e)
         self.producer.close()
         logger.info("Воркер остановлен")

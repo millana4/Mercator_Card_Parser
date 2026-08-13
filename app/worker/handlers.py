@@ -58,7 +58,7 @@ def handle_parse(task: dict, service: OzonService) -> dict:
         return {**echo, "ok": False, "card": None,
                 "error": "В задаче отсутствует sku", "error_code": "invalid_request"}
     try:
-        result = service.get_card_by_id(str(sku))
+        result = service.get_card_for_crawl_by_id(str(sku))
         return {**echo, "ok": True, "card": result["card"], "error": None}
     except Exception as e:
         logger.exception("PARSE задача провалилась | task_id=%s sku=%s", echo["task_id"], sku)

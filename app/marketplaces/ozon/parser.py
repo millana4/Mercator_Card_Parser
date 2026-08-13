@@ -62,6 +62,9 @@ class OzonParser:
             logger.error("Ошибка инициализации драйвера", exc_info=True)
             self.close()
             raise
+        # Счётчик сессии: сколько карточек ещё можно открыть до пересоздания.
+        self._session_left = 0
+        self._session_started = False
 
     # ------------------------------------------------------------------ #
     @staticmethod
@@ -95,7 +98,7 @@ class OzonParser:
         opts.add_experimental_option("useAutomationExtension", False)
         opts.add_argument(
             "--user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-            "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36"
+            "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/151.0.0.0 Safari/537.36"
         )
         opts.add_argument(f"--user-data-dir={self.chrome_temp_dir}")
 
@@ -133,6 +136,59 @@ class OzonParser:
             time.sleep(random.uniform(0.5, 1.5))
         except Exception:
             logger.debug("Движение мыши не удалось (вне окна) — пропускаю")
+
+    def visit_home(self) -> None:
+        """Начать сессию как человек: зайти на главную Ozon, осмотреться.
+        Кука с главной ложится в постоянный профиль, референс перехода на
+        карточку становится «человеческим» (не заход по прямому URL из ниоткуда)."""
+        try:
+            self.driver.set_page_load_timeout(self.policy.page_load_timeout)
+            logger.info("Старт сессии: захожу на главную Ozon")
+            self.driver.get("https://www.ozon.ru/")
+            self._pause()
+            self._random_mouse_movements()
+            self._pause()
+        except Exception as e:
+            logger.warning("Не удалось открыть главную (сессия всё равно продолжится): %s", e)
+
+    def _navigate_within_ozon(self, url: str) -> None:
+        """Перейти на карточку КАК живой пользователь — через window.location
+        со страницы Ozon, чтобы браузер сам проставил Referer=ozon.ru.
+        Если браузер сейчас не на Ozon (первый заход/сбой) — обычный get,
+        предварительно зайдя на главную."""
+        try:
+            cur = self.driver.current_url or ""
+        except Exception:
+            cur = ""
+
+        on_ozon = "ozon.ru" in cur
+
+        if not on_ozon:
+            # Не на Ozon — заходим на главную, чтобы следующий переход имел Referer.
+            logger.info("Браузер не на Ozon (url=%r) — открываю главную перед карточкой", cur)
+            self.driver.get("https://www.ozon.ru/")
+            self._pause()
+
+        # Переход изнутри Ozon: браузer сам поставит Referer текущей страницы.
+        # location.assign сохраняет реферер, в отличие от прямого driver.get.
+        self.driver.execute_script("window.location.assign(arguments[0]);", url)
+
+    def begin_session(self) -> None:
+        """Начать новую сессию: случайный лимит переходов + заход на главную."""
+        self._session_left = random.randint(self.policy.session_min,
+                                            self.policy.session_max)
+        self._session_started = True
+        logger.info("Новая сессия браузера: лимит переходов=%s", self._session_left)
+        self.visit_home()
+
+    def session_exhausted(self) -> bool:
+        """Сессия исчерпана — пора пересоздавать браузер."""
+        return self._session_left <= 0
+
+    def consume_session_step(self) -> None:
+        """Отметить, что одна карточка в сессии израсходована."""
+        self._session_left -= 1
+        logger.debug("Сессия: осталось переходов=%s", self._session_left)
 
     def _is_blocked(self) -> bool:
         """Признаки капчи/блокировки на странице."""
@@ -248,6 +304,45 @@ class OzonParser:
     extract_nuxt_state = staticmethod(extract_nuxt_state)
 
     # ------------------------------------------------------------------ #
+
+    def fetch_html_in_session(self, url: str) -> str:
+        """Открыть карточку в УЖЕ живом браузере (сессия переиспользуется).
+        В отличие от fetch_html, не управляет жизнью драйвера — это делает
+        владелец сессии (service). При капче бросает AntibotBlockedError СРАЗУ
+        (без ретраев): в сессии бан прерывает всю сессию."""
+        self.driver.set_page_load_timeout(self.policy.page_load_timeout)
+        logger.info("Открываю карточку в сессии: %s", url)
+        self._pause()
+        try:
+            self._navigate_within_ozon(url)
+        except Exception as e:
+            logger.warning("Ошибка загрузки страницы: %s", e)
+
+        if self._is_not_found():
+            logger.info("Карточка удалена (404): %s", url)
+            return self.driver.page_source
+
+        if self._is_blocked():
+            logger.warning("Антибот в сессии — прерываю сессию")
+            raise AntibotBlockedError(
+                "Не удалось получить страницу: антибот/блокировка.",
+                marketplace="ozon",
+            )
+
+        self._pause()
+        self._random_mouse_movements()
+        self._pause()
+        try:
+            self.wait.until(lambda d: "__NUXT__" in d.page_source)
+            logger.info("Страница отдала __NUXT__ — данные получены")
+            return self.driver.page_source
+        except Exception:
+            logger.warning("__NUXT__ не появился — считаю блокировкой")
+            raise AntibotBlockedError(
+                "Не удалось получить страницу: антибот/блокировка.",
+                marketplace="ozon",
+            )
+
     def screenshot_png(self) -> bytes | None:
         """Скриншот текущей страницы (для debug-артефактов). None при ошибке."""
         try:
