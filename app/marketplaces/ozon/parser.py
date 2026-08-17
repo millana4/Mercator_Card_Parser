@@ -24,8 +24,6 @@ from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.chrome.options import Options
 from selenium.webdriver.chrome.service import Service
 from selenium_stealth import stealth
-from webdriver_manager.chrome import ChromeDriverManager
-from webdriver_manager.core.os_manager import ChromeType
 
 from app.core.config import MarketplacePolicy
 from app.core.logging import get_logger
@@ -102,7 +100,7 @@ class OzonParser:
         )
         opts.add_argument(f"--user-data-dir={self.chrome_temp_dir}")
 
-        service = Service(ChromeDriverManager(chrome_type=ChromeType.GOOGLE).install())
+        service = Service("/usr/local/bin/chromedriver")
         self.driver = webdriver.Chrome(service=service, options=opts)
         stealth(
             self.driver,
