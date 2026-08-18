@@ -189,46 +189,34 @@ class OzonParser:
         logger.debug("Сессия: осталось переходов=%s", self._session_left)
 
     def _is_blocked(self) -> bool:
-        """Признаки капчи/блокировки на странице."""
-        # Быстрая проверка по исходнику/URL/заголовку — ловит новую капчу
-        # Ozon ('Antibot Captcha', редирект ?__rr=1), которую XPath ниже не видит.
+        """Признаки капчи/блокировки: заголовок, URL, iframe капчи, поле ввода."""
         try:
-            src = self.driver.page_source
+            title = self.driver.title or ""
+            cur_url = self.driver.current_url or ""
         except Exception:
-            src = ""
-        try:
-            title = (self.driver.title or "")
-        except Exception:
-            title = ""
-        try:
-            cur_url = (self.driver.current_url or "")
-        except Exception:
-            cur_url = ""
-        text_markers = ["Antibot Captcha", "antibot", "captcha", "px-captcha"]
-        low_src = src.lower()
-        if ("antibot captcha" in title.lower()
-                or "__rr=1" in cur_url
-                or any(mk.lower() in low_src for mk in text_markers)):
+            return False
+
+        # 1. Быстрая проверка по заголовку и URL (ловит 99% капч)
+        if "Antibot Captcha" in title or "__rr=1" in cur_url:
             logger.warning("Обнаружена капча/блокировка (title=%r, url=%r)", title, cur_url)
             return True
 
-        # Старые XPath-маркеры (на случай других страниц блокировки).
-        markers = [
-            "//h1[contains(text(), 'Доступ ограничен')]",
-            "//h1[contains(text(), 'Ой!')]",
-            "//title[contains(text(), 'Доступ')]",
-            "//div[contains(text(), 'проверку')]",
-            "//div[contains(text(), 'безопасност')]",
-            "//iframe[contains(@src, 'captcha')]",
-            "//input[@name='captcha']",
-        ]
-        for m in markers:
-            try:
-                if self.driver.find_elements(By.XPATH, m):
-                    logger.warning("Обнаружен маркер блокировки: %s", m)
-                    return True
-            except Exception:
-                continue
+        # 2. iframe с капчей
+        try:
+            if self.driver.find_elements(By.XPATH, "//iframe[contains(@src, 'captcha')]"):
+                logger.warning("Обнаружен iframe с капчей")
+                return True
+        except Exception:
+            pass
+
+        # 3. Поле ввода капчи (редко, но бывает)
+        try:
+            if self.driver.find_elements(By.XPATH, "//input[@name='captcha']"):
+                logger.warning("Обнаружено поле ввода капчи")
+                return True
+        except Exception:
+            pass
+
         return False
 
     def _is_not_found(self) -> bool:
@@ -246,7 +234,7 @@ class OzonParser:
         """
         Открыть карточку с ретраями и вернуть HTML.
         Бросает AntibotBlockedError, если все попытки упёрлись в блок.
-        Регион определяется Ozon по IP окружения (переключение города не делаем).
+        Регион определяется Ozon по IP окружения.
         """
         self.driver.set_page_load_timeout(self.policy.page_load_timeout)
         last_blocked = False
@@ -260,9 +248,11 @@ class OzonParser:
             except Exception as e:
                 logger.warning("Ошибка загрузки страницы: %s", e)
 
-            if self._is_not_found():
-                logger.info("Карточка удалена (Такой страницы не существует): %s", url)
-                return self.driver.page_source
+            # --- Проверка на редирект на поиск (тихая блокировка) ---
+            current_url = self.driver.current_url
+            if "/search/" in current_url and "/product/" not in current_url:
+                logger.warning("Редирект на поиск вместо карточки: %s", url)
+                raise AntibotBlockedError("Редирект на поиск (антибот)", marketplace="ozon")
 
             if self._is_blocked():
                 last_blocked = True
@@ -304,10 +294,7 @@ class OzonParser:
     # ------------------------------------------------------------------ #
 
     def fetch_html_in_session(self, url: str) -> str:
-        """Открыть карточку в УЖЕ живом браузере (сессия переиспользуется).
-        В отличие от fetch_html, не управляет жизнью драйвера — это делает
-        владелец сессии (service). При капче бросает AntibotBlockedError СРАЗУ
-        (без ретраев): в сессии бан прерывает всю сессию."""
+        """Открыть карточку в УЖЕ живом браузере (сессия переиспользуется)."""
         self.driver.set_page_load_timeout(self.policy.page_load_timeout)
         logger.info("Открываю карточку в сессии: %s", url)
         self._pause()
@@ -316,9 +303,11 @@ class OzonParser:
         except Exception as e:
             logger.warning("Ошибка загрузки страницы: %s", e)
 
-        if self._is_not_found():
-            logger.info("Карточка удалена (404): %s", url)
-            return self.driver.page_source
+        # --- Проверка на редирект на поиск ---
+        current_url = self.driver.current_url
+        if "/search/" in current_url and "/product/" not in current_url:
+            logger.warning("Редирект на поиск в сессии: %s", url)
+            raise AntibotBlockedError("Редирект на поиск (антибот)", marketplace="ozon")
 
         if self._is_blocked():
             logger.warning("Антибот в сессии — прерываю сессию")

@@ -1,5 +1,4 @@
 selenium==4.15.0
-webdriver-manager==4.0.2
 selenium-stealth==1.0.6
 fastapi==0.115.6
 uvicorn[standard]==0.34.0

@@ -20,14 +20,14 @@ class MarketplacePolicy(BaseSettings):
     headless: bool = False
     page_load_timeout: int = 30          # сек, set_page_load_timeout
     wait_timeout: int = 15               # сек, ожидание появления данных на странице
-    pause_min: float = 3.0               # мин. пауза между действиями (антибот)
-    pause_max: float = 6.0               # макс. пауза между действиями
+    pause_min: float = 40.0               # мин. пауза между действиями (антибот)
+    pause_max: float = 60.0               # макс. пауза между действиями
     retries: int = 3                     # число попыток при блокировке/ошибке
-    retry_pause_min: float = 20.0        # пауза между попытками, мин
-    retry_pause_max: float = 40.0        # пауза между попытками, макс
+    retry_pause_min: float = 60.0        # пауза между попытками, мин
+    retry_pause_max: float = 80.0        # пауза между попытками, макс
     # Темп воркера и реакция на серию блокировок
-    between_cards_min: float = 12.0  # пауза между карточками (primary), мин
-    between_cards_max: float = 18.0  # пауза между карточками (primary), макс
+    between_cards_min: float = 120.0  # пауза между карточками (primary), мин
+    between_cards_max: float = 180.0  # пауза между карточками (primary), макс
     # Щадящий темп запасного парсера (reserve): ~1 полный обход 323 карточек/сутки.
     # 24ч / 323 ≈ 267с на карточку; диапазон вокруг для случайности.
     reserve_between_cards_min: float = 240.0
@@ -74,13 +74,13 @@ class Settings(BaseSettings):
     ozon_headless: bool = Field(default=False, alias="OZON_HEADLESS")
     ozon_page_load_timeout: int = Field(default=30, alias="OZON_PAGE_LOAD_TIMEOUT")
     ozon_wait_timeout: int = Field(default=15, alias="OZON_WAIT_TIMEOUT")
-    ozon_pause_min: float = Field(default=3.0, alias="OZON_PAUSE_MIN")
-    ozon_pause_max: float = Field(default=6.0, alias="OZON_PAUSE_MAX")
+    ozon_pause_min: float = Field(default=40.0, alias="OZON_PAUSE_MIN")
+    ozon_pause_max: float = Field(default=60.0, alias="OZON_PAUSE_MAX")
     ozon_retries: int = Field(default=3, alias="OZON_RETRIES")
-    ozon_retry_pause_min: float = Field(default=20.0, alias="OZON_RETRY_PAUSE_MIN")
-    ozon_retry_pause_max: float = Field(default=40.0, alias="OZON_RETRY_PAUSE_MAX")
-    ozon_between_cards_min: float = Field(default=12.0, alias="OZON_BETWEEN_CARDS_MIN")
-    ozon_between_cards_max: float = Field(default=18.0, alias="OZON_BETWEEN_CARDS_MAX")
+    ozon_retry_pause_min: float = Field(default=60.0, alias="OZON_RETRY_PAUSE_MIN")
+    ozon_retry_pause_max: float = Field(default=80.0, alias="OZON_RETRY_PAUSE_MAX")
+    ozon_between_cards_min: float = Field(default=120.0, alias="OZON_BETWEEN_CARDS_MIN")
+    ozon_between_cards_max: float = Field(default=180.0, alias="OZON_BETWEEN_CARDS_MAX")
     ozon_reserve_between_cards_min: float = Field(default=240.0, alias="OZON_RESERVE_BETWEEN_CARDS_MIN")
     ozon_reserve_between_cards_max: float = Field(default=300.0, alias="OZON_RESERVE_BETWEEN_CARDS_MAX")
     ozon_antibot_streak_threshold: int = Field(default=3, alias="OZON_ANTIBOT_STREAK_THRESHOLD")
