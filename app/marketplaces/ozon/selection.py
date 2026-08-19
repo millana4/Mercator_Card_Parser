@@ -84,15 +84,10 @@ def compute_need(req: StratumRequest, today: date | None = None) -> Need:
     Если исключений по типу больше, чем требуется, — это ошибка входных данных.
     """
     # --- без сезонности - коллекция не важна ---
+    # count уже = потребность (дефицит): ядро вычло active при доборе.
+    # exclude здесь НЕ вычитаем — он служит только фильтром дублей в prefilter.
     if not req.is_seasonal:
-        have = len(req.exclude)
-        need_total = max(req.count - have, 0)
-        if have > req.count:
-            logger.warning(
-                "Входные данные: исключений (%s) больше требуемого count (%s) "
-                "для query=%r — потребность = 0", have, req.count, req.query
-            )
-        return Need(base=0, seasonal=0, season=None, total=need_total)
+        return Need(base=0, seasonal=0, season=None, total=req.count)
 
     # --- с сезонностью: base_share обязателен ---
     if req.base_share is None:
@@ -105,27 +100,11 @@ def compute_need(req: StratumRequest, today: date | None = None) -> Need:
     need_base = int(math.floor(req.count * req.base_share + 0.5))
     need_seasonal = req.count - need_base
 
-    # сколько уже есть в исключениях по типам
-    have_base = sum(1 for c in req.exclude if c.collection == Collection.BASE)
-    have_season = sum(1 for c in req.exclude if c.collection == season)
-
-    # проверка на «лишние» исключения — ошибка входных данных
-    if have_base > need_base:
-        logger.warning(
-            "Входные данные: базовых в исключениях (%s) больше требуемого (%s), query=%r",
-            have_base, need_base, req.query
-        )
-    if have_season > need_seasonal:
-        logger.warning(
-            "Входные данные: сезонных (%s) в исключениях больше требуемого (%s), query=%r",
-            have_season, need_seasonal, req.query
-        )
-
-    left_base = max(need_base - have_base, 0)
-    left_season = max(need_seasonal - have_season, 0)
-
-    logger.info("Потребность рассчитана: base=%s, season=%s, сезон=%s (исключений учтено: %s)",
-                left_base, left_season, season.value, len(req.exclude))
+    # count уже = потребность (дефицит): ядро вычло active. exclude не вычитаем.
+    left_base = need_base
+    left_season = need_seasonal
+    logger.info("Потребность рассчитана: base=%s, season=%s, сезон=%s",
+                left_base, left_season, season.value)
 
     return Need(
         base=left_base,
