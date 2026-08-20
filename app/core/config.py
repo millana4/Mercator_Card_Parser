@@ -39,7 +39,7 @@ class MarketplacePolicy(BaseSettings):
     session_max: int = 50
     # Пороги отбора карточек при подборе
     min_rating: float = 4.8  # минимальный рейтинг кандидата
-    min_reviews: int = 100  # минимальное число отзывов (строго больше)
+    min_reviews: int = 30  # минимальное число отзывов (строго больше)
     # Подбор: сбор пула кандидатов из выдачи
     pool_multiplier: int = 3  # целевой пул плиток = count * этот множитель
     max_pages: int = 10  # потолок прокруток выдачи
@@ -88,7 +88,7 @@ class Settings(BaseSettings):
     ozon_session_min: int = Field(default=10, alias="OZON_SESSION_MIN")
     ozon_session_max: int = Field(default=50, alias="OZON_SESSION_MAX")
     ozon_min_rating: float = Field(default=4.8, alias="OZON_MIN_RATING")
-    ozon_min_reviews: int = Field(default=100, alias="OZON_MIN_REVIEWS")
+    ozon_min_reviews: int = Field(default=30, alias="OZON_MIN_REVIEWS")
     ozon_pool_multiplier: int = Field(default=3, alias="OZON_POOL_MULTIPLIER")
     ozon_max_pages: int = Field(default=10, alias="OZON_MAX_PAGES")
     service_api_key: str = Field(default="", alias="SERVICE_API_KEY")
