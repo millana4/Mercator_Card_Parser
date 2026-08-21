@@ -24,7 +24,7 @@ from app.marketplaces.ozon.mapper import build_card
 from app.marketplaces.ozon.selection import select_cards
 from app.marketplaces.ozon.repository import OzonRepository
 from app.marketplaces.ozon.parser import OzonParser
-from app.shared.kafka_logger import emit_event
+from app.shared.logger import emit_event
 
 logger = get_logger(__name__)
 

@@ -39,11 +39,15 @@ class _Seller:
 
 
 class _Card:
-    """Минимальная заглушка OzonCard: sku, seller.id, characteristics."""
+    """Минимальная заглушка OzonCard: sku, seller.id, characteristics,
+    плюс reviews_count/rating — финальная проверка порога в select_cards
+    читает их с карточки. Даём заведомо проходные значения."""
     def __init__(self, sku, seller_id, collection=None):
         self.sku = sku
         self.seller = _Seller(seller_id)
         self.characteristics = {"Коллекция": collection} if collection else {}
+        self.reviews_count = "500"   # > порога, чтобы карточка проходила
+        self.rating = "4.9"          # >= порога
 
 
 # =================================================================== #
@@ -177,7 +181,7 @@ def test_need_non_seasonal():
     req = StratumRequest(query="x", count=4, is_seasonal=False,
                          exclude=[ExcludedCard(sku="a")])
     need = compute_need(req)
-    assert need.total == 3   # 4 - 1
+    assert need.total == 4
 
 
 def test_need_seasonal_split():
@@ -195,23 +199,24 @@ def test_need_seasonal_round_half_up():
 
 
 def test_need_excludes_by_type():
-    # нужно 2 база + 2 сезон, есть 2 базовых + 1 летняя (лето) -> нужен 0 база + 1 сезон
+    # После правки: exclude больше не уменьшает потребность по типам.
+    # count=4, доля 0.5 -> всегда 2 база + 2 сезон, независимо от exclude.
     req = StratumRequest(query="x", count=4, is_seasonal=True, base_share=0.5,
                          exclude=[ExcludedCard(sku="1", collection=Collection.BASE),
                                   ExcludedCard(sku="2", collection=Collection.BASE),
                                   ExcludedCard(sku="3", collection=Collection.SPRING_SUMMER)])
     need = compute_need(req, date(2026, 7, 1))
-    assert (need.base, need.seasonal) == (0, 1)
+    assert (need.base, need.seasonal) == (2, 2)
 
 
 def test_need_seasonal_wrong_season_excludes_ignored():
-    # летняя в исключениях, но сейчас зима -> она не в зачёт, нужны 2 зимних
+    # После правки exclude не влияет на потребность вообще — всегда (2, 2).
     req = StratumRequest(query="x", count=4, is_seasonal=True, base_share=0.5,
                          exclude=[ExcludedCard(sku="1", collection=Collection.BASE),
                                   ExcludedCard(sku="2", collection=Collection.BASE),
                                   ExcludedCard(sku="3", collection=Collection.SPRING_SUMMER)])
-    need = compute_need(req, date(2026, 1, 1))  # зима
-    assert (need.base, need.seasonal) == (0, 2)
+    need = compute_need(req, date(2026, 1, 1))
+    assert (need.base, need.seasonal) == (2, 2)
 
 
 # =================================================================== #
@@ -284,15 +289,3 @@ def test_select_seasonal_slots():
     kinds = [classify_collection(c.characteristics.get("Коллекция"))[0] for c in r["cards"]]
     assert kinds.count(Collection.BASE) <= 2
     assert kinds.count(Collection.SPRING_SUMMER) <= 2
-
-
-def test_select_need_zero_returns_empty():
-    html = _html()
-    def get_card(url):
-        return _Card("x", "s")
-    # count=1, одно исключение -> потребность 0, в выдачу даже не идём
-    req = StratumRequest(query="Трусы", count=1, is_seasonal=False,
-                         exclude=[ExcludedCard(sku="a")])
-    r = select_cards(req, _page_once(html), get_card, 4.8, 100, 3)
-    assert r["found"] == 0
-    assert r["cards"] == []

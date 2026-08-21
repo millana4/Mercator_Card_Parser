@@ -10,6 +10,7 @@ test_worker.py — тесты логики Kafka-воркера БЕЗ реал�
 
 import pytest
 
+from app.marketplaces.ozon.selection import Collection
 from app.worker.handlers import handle_select, handle_parse, _build_stratum_request
 
 import sys, types
@@ -41,7 +42,7 @@ class FakeService:
         return {"cards": [_FakeCard("1"), _FakeCard("2")],
                 "requested": req.count, "found": 2}
 
-    def get_card_by_id(self, sku):
+    def get_card_for_crawl_by_id(self, sku):
         if self.fail:
             raise RuntimeError("страница не грузится")
         return {"card": {"sku": sku, "name": "Рубашка Zella"}, "debug_files": None}
@@ -87,21 +88,23 @@ def test_select_failure():
 
 
 def test_select_builds_request_with_exclude():
+    # collection в контракте — enum Collection (base/spring_summer/autumn_winter),
+    # ядро присылает именно значение enum, а не название коллекции с карточки.
     task = {
         "query": "q", "count": 3, "is_seasonal": True, "base_share": 0.5,
         "exclude": [{
             "sku": "9", "name": "n", "url": "u",
-            "seller": "554625", "collection": "Весна-лето 2026",
+            "seller": "554625", "collection": "spring_summer",
         }],
     }
     req = _build_stratum_request(task)
     assert req.query == "q" and req.count == 3
     assert req.is_seasonal is True and req.base_share == 0.5
     assert len(req.exclude) == 1
-    # поле seller проброшено (не brand!) — соответствие Kafka-контракту
+    # поле seller проброшено (не brand!) — соответствие контракту
     assert req.exclude[0].seller == "554625"
-    # collection приходит строкой как есть
-    assert req.exclude[0].collection == "Весна-лето 2026"
+    # collection распарсилась в enum
+    assert req.exclude[0].collection == Collection.SPRING_SUMMER
 
 
 # ------------------------------------------------------------------ #
