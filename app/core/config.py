@@ -64,11 +64,6 @@ class Settings(BaseSettings):
     # Ключ для межсервисной авторизации. Сейчас не проверяется (заглушка).
     service_api_key: str = Field(default="", alias="SERVICE_API_KEY")
 
-    # --- Kafka (журнал событий). Если брокер недоступен — сервис работает без журнала. ---
-    kafka_enabled: bool = Field(default=False, alias="KAFKA_ENABLED")
-    kafka_bootstrap_servers: str = Field(default="localhost:9092", alias="KAFKA_BOOTSTRAP_SERVERS")
-    kafka_topic: str = Field(default="parsing-events", alias="KAFKA_TOPIC")
-
     # --- Политики маркетплейсов ---
     # Ozon: можно переопределить через env OZON_HEADLESS, OZON_RETRIES и т.д.
     ozon_headless: bool = Field(default=False, alias="OZON_HEADLESS")
