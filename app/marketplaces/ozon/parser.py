@@ -27,7 +27,7 @@ from selenium_stealth import stealth
 
 from app.core.config import MarketplacePolicy
 from app.core.logging import get_logger
-from app.core.exceptions import AntibotBlockedError
+from app.core.exceptions import AntibotBlockedError, OutOfStockError
 from app.marketplaces.ozon.nuxt import extract_nuxt_state
 
 logger = get_logger(__name__)
@@ -251,7 +251,11 @@ class OzonParser:
             # --- Проверка на редирект на поиск (тихая блокировка) ---
             current_url = self.driver.current_url
             if "/search/" in current_url and "/product/" not in current_url:
-                logger.warning("Редирект на поиск вместо карточки: %s", url)
+                sku = self._sku_from_url(url)
+                if sku and f"product_id={sku}" in current_url:
+                    logger.info("Товар закончился (редирект на поиск, product_id=%s)", sku)
+                    raise OutOfStockError(f"Товар закончился: sku={sku}")
+                logger.warning("Редирект на поиск вместо карточки (антибот): %s", url)
                 raise AntibotBlockedError("Редирект на поиск (антибот)", marketplace="ozon")
 
             if self._is_blocked():
@@ -306,7 +310,11 @@ class OzonParser:
         # --- Проверка на редирект на поиск ---
         current_url = self.driver.current_url
         if "/search/" in current_url and "/product/" not in current_url:
-            logger.warning("Редирект на поиск в сессии: %s", url)
+            sku = self._sku_from_url(url)
+            if sku and f"product_id={sku}" in current_url:
+                logger.info("Товар закончился (редирект на поиск, product_id=%s)", sku)
+                raise OutOfStockError(f"Товар закончился: sku={sku}")
+            logger.warning("Редирект на поиск в сессии (антибот): %s", url)
             raise AntibotBlockedError("Редирект на поиск (антибот)", marketplace="ozon")
 
         if self._is_blocked():
@@ -378,3 +386,11 @@ class OzonParser:
                                           self.policy.retry_pause_max))
         logger.warning("Плитки не появились после всех попыток")
         return self.driver.page_source
+
+
+    @staticmethod
+    def _sku_from_url(url: str) -> str | None:
+        """sku из url карточки: .../product/<sku>/ или .../product/<slug>-<sku>/."""
+        import re
+        m = re.search(r"/product/(?:[^/]*-)?(\d+)", url)
+        return m.group(1) if m else None

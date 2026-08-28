@@ -14,16 +14,17 @@ service.py — бизнес-логика парсинга Ozon (оркестра
 import os
 import json
 import time
-from datetime import datetime
+from datetime import datetime, timezone
 
 from app.core.config import settings, MarketplacePolicy
-from app.core.exceptions import AntibotBlockedError, InvalidRequestError, ProductNotFoundError
+from app.core.exceptions import AntibotBlockedError, InvalidRequestError, ProductNotFoundError, OutOfStockError
 from app.core.logging import get_logger
 from app.marketplaces.ozon.repository import OzonRepository
 from app.marketplaces.ozon.mapper import build_card
 from app.marketplaces.ozon.selection import select_cards
 from app.marketplaces.ozon.repository import OzonRepository
 from app.marketplaces.ozon.parser import OzonParser
+from app.marketplaces.ozon.models import OzonCard
 from app.shared.logger import emit_event
 
 logger = get_logger(__name__)
@@ -148,6 +149,19 @@ class OzonService:
         parser = self._crawl_parser
         try:
             html = parser.fetch_html_in_session(url)
+        except OutOfStockError:
+            # Товар закончился — НЕ бан, сессию НЕ рвём. Карточку строим вручную
+            # с нашим sku: build_card на HTML страницы поиска дал бы чужой sku
+            # (из выдачи аналогов). Цены пустые — товара нет.
+            sku = parser._sku_from_url(url)
+            card = OzonCard(
+                sku=sku,
+                url=url,
+                parsed_at=datetime.now(timezone.utc).isoformat(timespec="seconds"),
+                button_state="out_of_stock",
+            )
+            logger.info("get_card_for_crawl: товар закончился, sku=%s", sku)
+            return {"card": card.model_dump(), "debug_files": None}
         except AntibotBlockedError as exc:
             self._emit_blocked(url, exc)
             self._close_crawl_session()  # бан прерывает всю сессию

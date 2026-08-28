@@ -7,6 +7,7 @@ exceptions.py — доменные исключения сервиса и их �
   - AntibotBlockedError   — заблокировал антибот → имеет смысл повторить позже;
   - ProductNotFoundError  — товара/данных нет → пропустить;
   - InvalidRequestError   — кривой URL/SKU → отклонить, не повторять;
+  - OutOfStockError       — товар закончился: Ozon увёл на поиск, сохранив product_id запрошенного sku
   - ParsingError          — прочая ошибка парсинга.
 
 Каждый тип маппится на свой HTTP-статус и единый формат тела ошибки.
@@ -43,6 +44,14 @@ class InvalidRequestError(ParsingError):
     """Некорректный вход (URL/SKU). Повторять бессмысленно."""
     http_status = 400
     code = "invalid_request"
+
+
+class OutOfStockError(Exception):
+    """Товар закончился: Ozon увёл на поиск, сохранив product_id нашего sku.
+    Это НЕ антибот — карточка помечается out_of_stock, сессия не рвётся."""
+    def __init__(self, message: str = "Товар закончился", marketplace: str = "ozon"):
+        super().__init__(message)
+        self.marketplace = marketplace
 
 
 def _error_body(exc: ParsingError) -> dict:
