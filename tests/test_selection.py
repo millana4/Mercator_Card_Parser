@@ -7,23 +7,29 @@ test_selection.py — тесты подбора карточек под стра
 кандидатов, первичный отсев, расчёт потребности, сезонный фильтр,
 уникальность магазина и оркестратор набора с пагинацией.
 
+Категорийная логика (сезоны, коллекции, пороги, уникальность продавца)
+живёт в стратегиях app/categories — они и тестируются напрямую.
+
 Запуск: pytest tests/test_selection.py -v
 """
-
 import os
 from datetime import date
 
+from app.categories.clothing import ClothingStrategy
+from app.categories.kids_clothing import KidsClothingStrategy
+from app.categories.models import Collection, ExcludedCard, StratumRequest
+from app.categories.registry import get_strategy, known_categories
 from app.marketplaces.ozon.search_listing import (
     extract_candidates, extract_next_page, prefilter, dedupe, passes_quality,
 )
-from app.marketplaces.ozon.selection import (
-    Collection, ExcludedCard, StratumRequest,
-    current_season, expected_season_year, classify_collection,
-    compute_need, card_matches_slot, seller_is_free, select_cards,
-)
+from app.marketplaces.ozon.selection import seller_is_free, select_cards
 
 FIXTURE = os.path.join(os.path.dirname(__file__), "fixtures",
                        "ozon_search_trusy_zhenskie.html")
+
+# Стратегии под рукой: большинство проверок — про обычную одежду.
+CLOTHING = ClothingStrategy()
+KIDS = KidsClothingStrategy()
 
 
 def _html():
@@ -42,6 +48,7 @@ class _Card:
     """Минимальная заглушка OzonCard: sku, seller.id, characteristics,
     плюс reviews_count/rating — финальная проверка порога в select_cards
     читает их с карточки. Даём заведомо проходные значения."""
+
     def __init__(self, sku, seller_id, collection=None):
         self.sku = sku
         self.seller = _Seller(seller_id)
@@ -127,42 +134,67 @@ def test_prefilter_drops_excluded():
 
 
 # =================================================================== #
-#  Сезон / год / коллекция                                            #
+#  Реестр категорий                                                    #
+# =================================================================== #
+def test_registry_returns_strategies():
+    assert get_strategy("clothing").name == "clothing"
+    assert get_strategy("kids_clothing").name == "kids_clothing"
+    # по умолчанию — одежда (обратная совместимость со старым контрактом)
+    assert get_strategy(None).name == "clothing"
+
+
+def test_registry_rejects_unknown_category():
+    import pytest
+    from app.core.exceptions import InvalidRequestError
+    with pytest.raises(InvalidRequestError):
+        get_strategy("автозапчасти")
+
+
+def test_known_categories_listed():
+    cats = known_categories()
+    assert "clothing" in cats and "kids_clothing" in cats
+
+
+# =================================================================== #
+#  Сезон / год / коллекция (стратегия одежды)                          #
 # =================================================================== #
 def test_current_season():
-    assert current_season(date(2026, 7, 1)) == Collection.SPRING_SUMMER
-    assert current_season(date(2026, 1, 1)) == Collection.AUTUMN_WINTER
-    assert current_season(date(2026, 3, 1)) == Collection.SPRING_SUMMER
-    assert current_season(date(2026, 9, 1)) == Collection.AUTUMN_WINTER
+    assert CLOTHING.current_season(date(2026, 7, 1)) == Collection.SPRING_SUMMER
+    assert CLOTHING.current_season(date(2026, 1, 1)) == Collection.AUTUMN_WINTER
+    assert CLOTHING.current_season(date(2026, 3, 1)) == Collection.SPRING_SUMMER
+    assert CLOTHING.current_season(date(2026, 9, 1)) == Collection.AUTUMN_WINTER
 
 
 def test_expected_year():
-    assert expected_season_year(date(2026, 7, 1)) == 2026   # ВЛ
-    assert expected_season_year(date(2026, 10, 1)) == 2027  # ОЗ конец года
-    assert expected_season_year(date(2026, 1, 1)) == 2026   # ОЗ янв
+    assert CLOTHING.expected_season_year(date(2026, 7, 1)) == 2026   # ВЛ
+    assert CLOTHING.expected_season_year(date(2026, 10, 1)) == 2027  # ОЗ конец года
+    assert CLOTHING.expected_season_year(date(2026, 1, 1)) == 2026   # ОЗ янв
 
 
 def test_classify_collection():
-    assert classify_collection("Весна-лето 2026") == (Collection.SPRING_SUMMER, 2026)
-    assert classify_collection("Базовая коллекция") == (Collection.BASE, None)
-    assert classify_collection("Демисезон") == (Collection.BASE, None)
-    assert classify_collection("Лето")[0] == Collection.SPRING_SUMMER
-    assert classify_collection("Осень-зима 2027") == (Collection.AUTUMN_WINTER, 2027)
+    cc = CLOTHING.classify_collection
+    assert cc("Весна-лето 2026") == (Collection.SPRING_SUMMER, 2026)
+    assert cc("Базовая коллекция") == (Collection.BASE, None)
+    assert cc("Демисезон") == (Collection.BASE, None)
+    assert cc("Лето")[0] == Collection.SPRING_SUMMER
+    assert cc("Осень-зима 2027") == (Collection.AUTUMN_WINTER, 2027)
 
 
 def test_card_matches_slot_season():
     jul = date(2026, 7, 1)
-    assert card_matches_slot("Весна-лето 2026", "season", jul) is True
-    assert card_matches_slot("Весна-лето 2025", "season", jul) is False  # прошлогодняя
-    assert card_matches_slot("Лето", "season", jul) is True              # без года
-    assert card_matches_slot("Базовая коллекция", "season", jul) is False
+    m = CLOTHING.card_matches_slot
+    assert m("Весна-лето 2026", "season", jul) is True
+    assert m("Весна-лето 2025", "season", jul) is False  # прошлогодняя
+    assert m("Лето", "season", jul) is True              # без года
+    assert m("Базовая коллекция", "season", jul) is False
 
 
 def test_card_matches_slot_base():
     jul = date(2026, 7, 1)
-    assert card_matches_slot("Базовая коллекция", "base", jul) is True
-    assert card_matches_slot("Демисезон", "base", jul) is True
-    assert card_matches_slot("Весна-лето 2026", "base", jul) is False
+    m = CLOTHING.card_matches_slot
+    assert m("Базовая коллекция", "base", jul) is True
+    assert m("Демисезон", "base", jul) is True
+    assert m("Весна-лето 2026", "base", jul) is False
 
 
 def test_seller_uniqueness():
@@ -175,48 +207,109 @@ def test_seller_uniqueness():
 
 
 # =================================================================== #
+#  Детская одежда: школьная коллекция и продавцы                       #
+# =================================================================== #
+def test_kids_school_collection_is_base():
+    """«Школа 2026» у детской одежды — базовая коллекция.
+    У взрослой она не распознаётся вовсе."""
+    assert KIDS.classify_collection("Школа 2026") == (Collection.BASE, 2026)
+    assert KIDS.classify_collection("Школьная коллекция")[0] == Collection.BASE
+    # у взрослой одежды такого правила нет: без типа год не возвращается
+    assert CLOTHING.classify_collection("Школа 2026") == (None, None)
+
+
+def test_kids_school_fits_base_slot():
+    jul = date(2026, 7, 1)
+    assert KIDS.card_matches_slot("Школа 2026", "base", jul) is True
+    assert KIDS.card_matches_slot("Школа 2026", "season", jul) is False
+
+
+def test_kids_keeps_clothing_seasons():
+    """Остальная сезонная логика у детской наследуется без изменений."""
+    jul = date(2026, 7, 1)
+    assert KIDS.classify_collection("Весна-лето 2026") == (Collection.SPRING_SUMMER, 2026)
+    assert KIDS.card_matches_slot("Весна-лето 2025", "season", jul) is False
+
+
+def test_kids_does_not_require_unique_seller():
+    assert CLOTHING.require_unique_seller is True
+    assert KIDS.require_unique_seller is False
+
+
+# =================================================================== #
+#  Пороги качества                                                     #
+# =================================================================== #
+class _Policy:
+    """Заглушка политики маркетплейса: только пороги."""
+    min_rating = 4.8
+    min_reviews = 30
+
+
+def test_thresholds_fall_back_to_policy():
+    """Категория без своих порогов берёт их из политики маркетплейса."""
+    assert CLOTHING.thresholds(_Policy()) == (4.8, 30)
+    assert KIDS.thresholds(_Policy()) == (4.8, 30)
+
+
+def test_thresholds_category_overrides_policy():
+    """Категория со своими порогами перекрывает политику."""
+    class _Loose(ClothingStrategy):
+        name = "loose"
+        min_rating = 4.5
+        min_reviews = 10
+
+    assert _Loose().thresholds(_Policy()) == (4.5, 10)
+
+
+# =================================================================== #
 #  Расчёт потребности                                                 #
 # =================================================================== #
 def test_need_non_seasonal():
     req = StratumRequest(query="x", count=4, is_seasonal=False,
                          exclude=[ExcludedCard(sku="a")])
-    need = compute_need(req)
+    need = CLOTHING.compute_need(req)
     assert need.total == 4
 
 
 def test_need_seasonal_split():
     # count=4, доля 0.5 -> 2 база + 2 сезон
     req = StratumRequest(query="x", count=4, is_seasonal=True, base_share=0.5)
-    need = compute_need(req, date(2026, 7, 1))
+    need = CLOTHING.compute_need(req, date(2026, 7, 1))
     assert (need.base, need.seasonal) == (2, 2)
 
 
 def test_need_seasonal_round_half_up():
     # count=5, доля 0.5 -> 3 база (в пользу базы) + 2 сезон
     req = StratumRequest(query="x", count=5, is_seasonal=True, base_share=0.5)
-    need = compute_need(req, date(2026, 7, 1))
+    need = CLOTHING.compute_need(req, date(2026, 7, 1))
     assert (need.base, need.seasonal) == (3, 2)
 
 
 def test_need_excludes_by_type():
-    # После правки: exclude больше не уменьшает потребность по типам.
-    # count=4, доля 0.5 -> всегда 2 база + 2 сезон, независимо от exclude.
+    # exclude не уменьшает потребность по типам: count уже равен дефициту.
     req = StratumRequest(query="x", count=4, is_seasonal=True, base_share=0.5,
                          exclude=[ExcludedCard(sku="1", collection=Collection.BASE),
                                   ExcludedCard(sku="2", collection=Collection.BASE),
                                   ExcludedCard(sku="3", collection=Collection.SPRING_SUMMER)])
-    need = compute_need(req, date(2026, 7, 1))
+    need = CLOTHING.compute_need(req, date(2026, 7, 1))
     assert (need.base, need.seasonal) == (2, 2)
 
 
 def test_need_seasonal_wrong_season_excludes_ignored():
-    # После правки exclude не влияет на потребность вообще — всегда (2, 2).
     req = StratumRequest(query="x", count=4, is_seasonal=True, base_share=0.5,
                          exclude=[ExcludedCard(sku="1", collection=Collection.BASE),
                                   ExcludedCard(sku="2", collection=Collection.BASE),
                                   ExcludedCard(sku="3", collection=Collection.SPRING_SUMMER)])
-    need = compute_need(req, date(2026, 1, 1))
+    need = CLOTHING.compute_need(req, date(2026, 1, 1))
     assert (need.base, need.seasonal) == (2, 2)
+
+
+def test_need_kids_same_as_clothing():
+    """Детская одежда считает потребность так же, как взрослая."""
+    req = StratumRequest(query="x", count=5, is_seasonal=True, base_share=0.5,
+                         category="kids_clothing")
+    need = KIDS.compute_need(req, date(2026, 7, 1))
+    assert (need.base, need.seasonal) == (3, 2)
 
 
 # =================================================================== #
@@ -231,11 +324,13 @@ def _page_once(html):
 
 def test_select_non_seasonal_picks_count():
     html = _html()
+
     # каждой карточке — уникальный магазин
     def get_card(url):
         import re
         sku = re.search(r"-(\d+)/?$", url).group(1)
         return _Card(sku, "seller_" + sku[-3:])
+
     req = StratumRequest(query="Трусы", count=3, is_seasonal=False)
     r = select_cards(req, _page_once(html), get_card, 4.8, 100, 3, date(2026, 7, 1))
     assert r["found"] == 3
@@ -244,10 +339,12 @@ def test_select_non_seasonal_picks_count():
 
 def test_select_stops_when_enough():
     html = _html()
+
     def get_card(url):
         import re
         sku = re.search(r"-(\d+)/?$", url).group(1)
         return _Card(sku, "seller_" + sku[-3:])
+
     req = StratumRequest(query="Трусы", count=2, is_seasonal=False)
     r = select_cards(req, _page_once(html), get_card, 4.8, 100, 3, date(2026, 7, 1))
     assert r["found"] == 2   # ровно 2, не больше
@@ -255,37 +352,75 @@ def test_select_stops_when_enough():
 
 def test_select_seller_dedup_needs_next_page():
     html = _html()
+
     # все карточки — один магазин: с одной страницы наберём максимум 1
     def get_card(url):
         return _Card("x", "ONE_SHOP")
+
     # fetch_page с одной следующей страницей (та же выдача), затем конец
     calls = {"n": 0}
+
     def fetch(url):
         calls["n"] += 1
         nxt = "page2" if calls["n"] == 1 else None
         return {"html": html, "url": url or "page1", "next_page": nxt}
+
     req = StratumRequest(query="Трусы", count=2, is_seasonal=False)
     r = select_cards(req, fetch, get_card, 4.8, 100, 3, date(2026, 7, 1))
     assert r["found"] == 1          # больше одного магазина не набрать
     assert calls["n"] == 2          # была попытка второй страницы
 
 
+def test_select_kids_ignores_seller_dedup():
+    """У детской одежды один продавец не мешает: набираем сколько нужно."""
+    html = _html()
+
+    def get_card(url):
+        import re
+        sku = re.search(r"-(\d+)/?$", url).group(1)
+        return _Card(sku, "ONE_SHOP")   # все карточки одного магазина
+
+    req = StratumRequest(query="Футболка для девочки", count=2,
+                         is_seasonal=False, category="kids_clothing")
+    r = select_cards(req, _page_once(html), get_card, 4.8, 100, 3, date(2026, 7, 1))
+    assert r["found"] == 2   # уникальность продавца не требуется
+
+
 def test_select_seasonal_slots():
     html = _html()
     cands = extract_candidates(html)
     order = [c.sku for c in prefilter(cands, [], 4.8, 100)]
+
     # назначим коллекции: чередуем сезонные и базовые, магазины уникальны
     colls = {}
     for i, sku in enumerate(order):
         colls[sku] = "Весна-лето 2026" if i % 2 == 0 else "Базовая коллекция"
+
     def get_card(url):
         import re
         sku = re.search(r"-(\d+)/?$", url).group(1)
         return _Card(sku, "seller_" + sku, colls.get(sku, "Демисезон"))
+
     # нужно 2 база + 2 сезон
     req = StratumRequest(query="Трусы", count=4, is_seasonal=True, base_share=0.5)
     r = select_cards(req, _page_once(html), get_card, 4.8, 100, 3, date(2026, 7, 1))
-    # проверим, что набранное разложилось по слотам корректно
-    kinds = [classify_collection(c.characteristics.get("Коллекция"))[0] for c in r["cards"]]
+
+    kinds = [CLOTHING.classify_collection(c.characteristics.get("Коллекция"))[0]
+             for c in r["cards"]]
     assert kinds.count(Collection.BASE) <= 2
     assert kinds.count(Collection.SPRING_SUMMER) <= 2
+
+
+def test_select_kids_takes_school_collection():
+    """Школьные карточки попадают в базовый слот у детской одежды."""
+    html = _html()
+
+    def get_card(url):
+        import re
+        sku = re.search(r"-(\d+)/?$", url).group(1)
+        return _Card(sku, "seller_" + sku, "Школа 2026")
+
+    req = StratumRequest(query="Рубашка для мальчика", count=2, is_seasonal=True,
+                         base_share=1.0, category="kids_clothing")
+    r = select_cards(req, _page_once(html), get_card, 4.8, 100, 3, date(2026, 7, 1))
+    assert r["found"] == 2

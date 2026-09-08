@@ -19,10 +19,12 @@ def handle_select(task: dict, service: OzonService) -> dict:
         "set_id": task.get("set_id"),
         "stratum_id": task.get("stratum_id"),
         "geo": task.get("geo"),
+        "marketplace": task.get("marketplace"),
     }
-    logger.info("SELECT задача | task_id=%s set_id=%s stratum_id=%s query=%r count=%s",
+    logger.info("SELECT задача | task_id=%s set_id=%s stratum_id=%s "
+                "категория=%s query=%r count=%s",
                 echo["task_id"], echo["set_id"], echo["stratum_id"],
-                task.get("query"), task.get("count"))
+                task.get("category"), task.get("query"), task.get("count"))
     try:
         req = _build_stratum_request(task)
         result = service.select_for_stratum(req)
@@ -49,6 +51,7 @@ def handle_parse(task: dict, service: OzonService) -> dict:
         "card_id": task.get("card_id"),
         "sku": task.get("sku"),
         "geo": task.get("geo"),
+        "marketplace": task.get("marketplace"),
     }
     logger.info("PARSE задача | task_id=%s card_id=%s sku=%s",
                 echo["task_id"], echo["card_id"], echo["sku"])
@@ -82,6 +85,7 @@ def _build_stratum_request(task: dict) -> StratumRequest:
         is_seasonal=task.get("is_seasonal", False),
         base_share=task.get("base_share"),
         exclude=exclude,
+        category=task.get("category") or "clothing",
     )
 
 

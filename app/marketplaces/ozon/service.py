@@ -319,21 +319,26 @@ class OzonService:
 
     def select_for_stratum(self, req) -> dict:
         """
-        Подбор карточек под страту. Оркестрация в selection.select_cards,
+        Подбор карточек под страту. Категорийная логика — в стратегии
+        (app/categories), оркестрация — в selection.select_cards,
         карточки берутся существующим get_card (тот же путь, что card/by-url).
         """
+        from app.categories.registry import get_strategy
 
-        logger.info("Подбор для страты: query=%r count=%s seasonal=%s base_share=%s исключений=%s",
-                    req.query, req.count, req.is_seasonal, req.base_share, len(req.exclude))
+        strategy = get_strategy(getattr(req, "category", None))
+        min_rating, min_reviews = strategy.thresholds(self.policy)
+
+        logger.info("Подбор для страты: категория=%s query=%r count=%s seasonal=%s "
+                    "base_share=%s исключений=%s пороги=(%s, %s)",
+                    strategy.name, req.query, req.count, req.is_seasonal,
+                    req.base_share, len(req.exclude), min_rating, min_reviews)
 
         def fetch_page(url):
             # первая страница — по query (url=None), следующие — по nextPage
             return self.repo.fetch_search_raw(query=req.query if url is None else None, url=url)
 
         def get_card_only(card_url):
-            # get_card возвращает dict {"card":..., "debug_files":...}; берём OzonCard
             res = self.get_card(card_url)
-            # res["card"] — это dict; превратим обратно в OzonCard для единообразия ответа
             from app.marketplaces.ozon.models import OzonCard
             return OzonCard(**res["card"])
 
@@ -341,8 +346,9 @@ class OzonService:
             req,
             fetch_page=fetch_page,
             get_card=get_card_only,
-            min_rating=self.policy.min_rating,
-            min_reviews=self.policy.min_reviews,
+            min_rating=min_rating,
+            min_reviews=min_reviews,
             max_pages=self.policy.max_pages,
+            strategy=strategy,
         )
         return result

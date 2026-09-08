@@ -1,17 +1,22 @@
 # -*- coding: utf-8 -*-
 """
 consumer.py — цикл потребления задач из Redis.
-Воркер тянет задачи из общего пула (BRPOP по ключам select/parse своего гео),
-выполняет и кладёт результат в список результатов. Общий пул = work-stealing:
+
+Воркер тянет задачи из общего пула (BRPOP по ключам select/parse тех
+площадок, что перечислены в PARSER_MARKETPLACES), выполняет и кладёт
+результат в список результатов той же площадки. Общий пул = work-stealing:
 любой свободный воркер берёт следующую задачу, застрявший на антибот-паузе
-просто не тянет новую — остальные продолжают. Партиций/групп/коммитов нет.
+просто не тянет новую — остальные продолжают.
+
 Подключение к Redis отказоустойчивое: ждёт Redis и переживает его падения.
 """
 import json
 import time
 import signal
 import random
+
 import redis
+
 from app.core.logging import get_logger
 from app.marketplaces.ozon.service import OzonService
 from app.worker.redis_config import redis_worker_settings as rws
@@ -29,6 +34,8 @@ class TaskConsumer:
         self._running = True
         self._antibot_streak = 0        # блокировок подряд
         self._policy = self.service.policy
+        # Ключ задачи -> (поток, маркетплейс). Считаем один раз при старте.
+        self._routes = rws.key_routes
 
     def stop(self, *_):
         logger.info("Сигнал остановки — завершаю после текущей задачи")
@@ -58,8 +65,10 @@ class TaskConsumer:
     def run(self):
         signal.signal(signal.SIGINT, self.stop)
         signal.signal(signal.SIGTERM, self.stop)
-        logger.info("Воркер запущен | регион=%s (%s) | роль=%s | parser_id=%s",
-                    rws.geo_code, rws.geo_name, rws.role, rws.parser_id)
+
+        logger.info("Воркер запущен | регион=%s (%s) | площадки=%s | роль=%s | parser_id=%s",
+                    rws.geo_code, rws.geo_name, ", ".join(rws.marketplaces),
+                    rws.role, rws.parser_id)
 
         while self._running:
             if self.redis is None:
@@ -80,7 +89,7 @@ class TaskConsumer:
         self._shutdown()
 
     def _consume_loop(self):
-        """Внутренний цикл: BRPOP по обоим ключам задач, пока нас не остановили."""
+        """Внутренний цикл: BRPOP по всем ключам задач, пока нас не остановили."""
         while self._running:
             if self.redis is None:
                 return
@@ -95,23 +104,26 @@ class TaskConsumer:
                 return  # cooldown обнулил клиент внутри обработки
 
     def _process_one(self, key: str, raw: str) -> None:
+        route = self._routes.get(key)
+        if route is None:
+            logger.warning("Задача из неожиданного ключа %s — пропускаю", key)
+            return
+        stream, marketplace = route
+
         try:
             task = json.loads(raw)
         except Exception as e:
             logger.error("Не разобрать задачу из %s: %s — пропускаю", key, e)
             return
 
-        logger.info("Получена задача из %s", key)
+        logger.info("Получена задача из %s (площадка=%s, поток=%s)", key, marketplace, stream)
 
-        if key == rws.select_tasks_key:
+        if stream == "select":
             result = handle_select(task, self.service)
-            result_key = rws.select_results_key
-        elif key == rws.parse_tasks_key:
-            result = handle_parse(task, self.service)
-            result_key = rws.parse_results_key
+            result_key = rws.select_results_key(marketplace)
         else:
-            logger.warning("Задача из неожиданного ключа %s — пропускаю", key)
-            return
+            result = handle_parse(task, self.service)
+            result_key = rws.parse_results_key(marketplace)
 
         # Проставляем, какой воркер отдал результат (наблюдаемость).
         result["parser_id"] = rws.parser_id
@@ -125,22 +137,22 @@ class TaskConsumer:
                          result.get("task_id"))
             return
 
-        # Счётчики наблюдаемости.
+        # Счётчики наблюдаемости — свои на каждую площадку.
         if result.get("error_code") == "antibot_blocked":
-            self.producer.incr_counter(rws.counter_antibot)
+            self.producer.incr_counter(rws.counter_antibot(marketplace))
         else:
-            self.producer.incr_counter(rws.counter_done)
+            self.producer.incr_counter(rws.counter_done(marketplace))
 
         # Реакция на антибот — только для задач обхода.
-        if key == rws.parse_tasks_key:
+        if stream == "parse":
             self._react_to_antibot(result)
 
         self._pause_between_cards()
 
     def _react_to_antibot(self, result: dict) -> None:
         """Считает блокировки подряд. При полосе — cooldown: воркер перестаёт
-        тянуть задачи на время остывания IP. В отличие от Kafka выходить из
-        группы не нужно — задачи лежат в общем пуле, их берут другие воркеры."""
+        тянуть задачи на время остывания IP. Задачи лежат в общем пуле,
+        их разберут другие воркеры."""
         if result.get("error_code") == "antibot_blocked":
             self._antibot_streak += 1
             logger.warning("Антибот подряд: %s/%s",
