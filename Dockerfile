@@ -1,9 +1,5 @@
 FROM python:3.13-slim
-
-# Версия Chrome и chromedriver фиксирована: отпечаток браузера влияет на
-# антибот Ozon, поэтому версия не должна меняться при пересборке образа.
-# Менять только осознанно, здесь — в одном месте.
-ARG CHROME_VERSION=151.0.7922.169
+ARG CHROME_VERSION=152.0.7977.64
 
 RUN apt-get update && apt-get install -y \
     wget gnupg xvfb unzip curl \
