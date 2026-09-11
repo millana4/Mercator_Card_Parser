@@ -22,6 +22,7 @@ class RedisWorkerSettings(BaseSettings):
     host: str = Field(default="localhost", alias="REDIS_HOST")
     port: int = Field(default=6379, alias="REDIS_PORT")
     db: int = Field(default=0, alias="REDIS_DB")
+    password: str | None = Field(default=None, alias="REDIS_PASSWORD")
 
     # --- Регион ---
     geo_code: str = Field(default="spb", alias="OZON_GEO_CODE")

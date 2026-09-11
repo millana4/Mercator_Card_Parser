@@ -49,6 +49,7 @@ class TaskConsumer:
             try:
                 client = redis.Redis(
                     host=rws.host, port=rws.port, db=rws.db,
+                    password=rws.password,
                     decode_responses=True,
                     socket_connect_timeout=10,
                 )
