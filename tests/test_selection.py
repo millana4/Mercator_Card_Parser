@@ -166,9 +166,10 @@ def test_current_season():
 
 
 def test_expected_year():
+    """Минимальный год сезонной коллекции — год начала текущего сезона."""
     assert CLOTHING.expected_season_year(date(2026, 7, 1)) == 2026   # ВЛ
-    assert CLOTHING.expected_season_year(date(2026, 10, 1)) == 2027  # ОЗ конец года
-    assert CLOTHING.expected_season_year(date(2026, 1, 1)) == 2026   # ОЗ янв
+    assert CLOTHING.expected_season_year(date(2026, 10, 1)) == 2026  # ОЗ конец года
+    assert CLOTHING.expected_season_year(date(2027, 1, 15)) == 2026  # ОЗ январь: сезон начался в 2026
 
 
 def test_classify_collection():
@@ -178,6 +179,10 @@ def test_classify_collection():
     assert cc("Демисезон") == (Collection.BASE, None)
     assert cc("Лето")[0] == Collection.SPRING_SUMMER
     assert cc("Осень-зима 2027") == (Collection.AUTUMN_WINTER, 2027)
+    # поле «Коллекция» не заполнено — карточка базовая
+    assert cc(None) == (Collection.BASE, None)
+    assert cc("") == (Collection.BASE, None)
+    assert cc("   ") == (Collection.BASE, None)
 
 
 def test_card_matches_slot_season():
@@ -195,6 +200,26 @@ def test_card_matches_slot_base():
     assert m("Базовая коллекция", "base", jul) is True
     assert m("Демисезон", "base", jul) is True
     assert m("Весна-лето 2026", "base", jul) is False
+
+
+def test_card_matches_slot_autumn_winter():
+    """Сентябрь 2026: текущий сезон — осень-зима 2026/2027."""
+    sep = date(2026, 9, 28)
+    m = CLOTHING.card_matches_slot
+    assert m("Осень-зима 2026", "season", sep) is True
+    assert m("Осень-зима 2026/2027", "season", sep) is True
+    assert m("Осень-зима 2025/2026", "season", sep) is False  # прошлый сезон
+    assert m("Осень-зима 2025", "season", sep) is False
+    assert m("Весна-лето 2026", "season", sep) is False
+
+
+def test_empty_collection_fits_base_slot():
+    """Карточка без поля «Коллекция» идёт в базовый слот, в сезонный — нет."""
+    jul = date(2026, 7, 1)
+    m = CLOTHING.card_matches_slot
+    assert m(None, "base", jul) is True
+    assert m("", "base", jul) is True
+    assert m(None, "season", jul) is False
 
 
 def test_seller_uniqueness():

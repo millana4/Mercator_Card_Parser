@@ -46,17 +46,17 @@ class ClothingStrategy(CategoryStrategy):
 
     def expected_season_year(self, today: date | None = None) -> int:
         """
-        Минимальный допустимый год сезонной коллекции.
+        Минимальный допустимый год сезонной коллекции — год, в котором начался
+        текущий сезон. Год коллекции берётся первым в строке:
+        'Осень-зима 2026' и 'Осень-зима 2026/2027' -> 2026.
           весна-лето (март–август)      -> текущий год
-          осень-зима (сентябрь–декабрь) -> следующий год
-          осень-зима (январь–февраль)   -> текущий год
+          осень-зима (сентябрь–декабрь) -> текущий год
+          осень-зима (январь–февраль)   -> предыдущий год
         """
         today = today or date.today()
         m, y = today.month, today.year
-        if 3 <= m <= 8:
-            return y
-        if 9 <= m <= 12:
-            return y + 1
+        if m <= 2:
+            return y - 1
         return y
 
     # ------------------------------------------------------------------ #
@@ -69,10 +69,12 @@ class ClothingStrategy(CategoryStrategy):
           'Базовая коллекция' -> (BASE, None)
           'Демисезон'         -> (BASE, None)
           'Лето'              -> (SPRING_SUMMER, None)
-        Не удалось распознать -> (None, None).
+          None / ''           -> (BASE, None)  — поле не заполнено, считаем базовой
+        Непустое, но не распознанное значение -> (None, None).
         """
-        if not coll_text:
-            return None, None
+        if not coll_text or not coll_text.strip():
+            # Поле «Коллекция» не заполнено — карточка относится к базовым.
+            return Collection.BASE, None
 
         t = coll_text.strip().lower()
 
