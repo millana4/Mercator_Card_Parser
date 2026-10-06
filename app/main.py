@@ -35,6 +35,12 @@ app.include_router(ozon.router, prefix=settings.api_prefix)
 app.include_router(files.router, prefix=settings.api_prefix)
 app.include_router(health.router, prefix=settings.api_prefix)
 
+
+@app.on_event("shutdown")
+def _close_browsers() -> None:
+    """Закрыть долгоживущий браузер HTTP-сервиса при остановке."""
+    ozon.shutdown_service()
+
 logger.info("Parsing Service запущен. DEBUG=%s, префикс=%s", settings.debug, settings.api_prefix)
 
 

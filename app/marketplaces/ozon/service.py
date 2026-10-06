@@ -3,38 +3,47 @@
 service.py — бизнес-логика парсинга Ozon (оркестратор).
 
 Дирижирует слоями, сам ничего не парсит и не извлекает:
-  1) репозиторий достаёт сырьё (html + nuxt_state);
+  1) источник отдаёт сырьё (html + nuxt_state);
   2) mapper превращает сырьё в доменную карточку OzonCard;
   3) при DEBUG сохраняются артефакты (html/json/png) на диск;
   4) в Kafka уходит событие о результате (если включено).
 
-Возвращает структуры, удобные для эндпоинтов (карточка / сырьё + debug-файлы).
+Два режима получения страниц:
+  - use_session=False (воркер, как раньше): карточки и выдача для подбора —
+    новый браузер на вызов (repository); обход — долгоживущая сессия;
+  - use_session=True (HTTP API): всё через одну долгоживущую сессию браузера,
+    как у обхода в воркере: главная, переходы изнутри Ozon, браузер переживает
+    запросы. Вызовы выполняются по очереди под блокировкой.
 """
 
 import os
 import json
+import threading
 import time
 from datetime import datetime, timezone
 
 from app.core.config import settings, MarketplacePolicy
 from app.core.exceptions import AntibotBlockedError, InvalidRequestError, ProductNotFoundError, OutOfStockError
 from app.core.logging import get_logger
-from app.marketplaces.ozon.repository import OzonRepository
 from app.marketplaces.ozon.mapper import build_card
-from app.marketplaces.ozon.selection import select_cards
-from app.marketplaces.ozon.repository import OzonRepository
-from app.marketplaces.ozon.parser import OzonParser
 from app.marketplaces.ozon.models import OzonCard
+from app.marketplaces.ozon.nuxt import extract_nuxt_state
+from app.marketplaces.ozon.parser import OzonParser
+from app.marketplaces.ozon.repository import OzonRepository
+from app.marketplaces.ozon.search_listing import extract_next_page, extract_pagination
+from app.marketplaces.ozon.selection import select_cards
 from app.shared.logger import emit_event
 
 logger = get_logger(__name__)
 
 
 class OzonService:
-    def __init__(self, policy: MarketplacePolicy | None = None):
+    def __init__(self, policy: MarketplacePolicy | None = None, use_session: bool = False):
         self.policy = policy or settings.ozon_policy()
         self.repo = OzonRepository(self.policy)
-        self._crawl_parser = None  # долгоживущий парсер для сессии
+        self.use_session = use_session
+        self._crawl_parser = None       # долгоживущий парсер для сессии
+        self._lock = threading.RLock()  # один браузер - вызовы по очереди
 
     # ------------------------------------------------------------------ #
     def _basename(self, url: str) -> str:
@@ -74,16 +83,82 @@ class OzonService:
         logger.debug("Сохранены debug-файлы: %s", files)
         return files
 
+    # ================= Источник страниц: новый браузер или сессия ================= #
+    def _fetch_raw(self, url: str) -> dict:
+        """Сырьё карточки/страницы {html, nuxt_state, screenshot_png, url, not_found}.
+        В режиме сессии - через долгоживущий браузер; при антиботе сессия закрывается.
+        OutOfStockError и AntibotBlockedError пробрасываются."""
+        if not self.use_session:
+            return self.repo.fetch_raw(url)
+        url = (url or "").strip()
+        if not url:
+            raise InvalidRequestError("Пустой URL", marketplace="ozon")
+        self._ensure_crawl_session()
+        parser = self._crawl_parser
+        try:
+            html = parser.fetch_html_in_session(url)
+        except AntibotBlockedError:
+            self._close_crawl_session()
+            raise
+        finally:
+            parser.consume_session_step()
+        not_found = ('data-widget="error"' in html
+                     or "Такой страницы не существует" in html)
+        nuxt = {} if not_found else extract_nuxt_state(html)
+        return {"html": html, "nuxt_state": nuxt, "screenshot_png": parser.screenshot_png(),
+                "url": url, "not_found": not_found}
+
+    def _listing_in_session(self, page_url: str, scroll_steps: int) -> dict:
+        """Одна страница выдачи в долгоживущей сессии (с прокруткой или без):
+        {html, url, next_page, current_page, total_pages, screenshot_png}."""
+        self._ensure_crawl_session()
+        parser = self._crawl_parser
+        try:
+            html = parser.fetch_listing_scrolled(page_url, scroll_steps)
+        except AntibotBlockedError:
+            self._close_crawl_session()
+            raise
+        finally:
+            parser.consume_session_step()
+        nuxt = {}
+        try:
+            nuxt = extract_nuxt_state(html) or {}
+        except Exception as e:
+            logger.warning("Не удалось разобрать __NUXT__ выдачи: %s", e)
+        current_page, total_pages = extract_pagination(nuxt)
+        return {"html": html, "url": page_url, "next_page": extract_next_page(html),
+                "current_page": current_page, "total_pages": total_pages,
+                "screenshot_png": parser.screenshot_png()}
+
+    def _fetch_listing(self, query: str | None = None, url: str | None = None) -> dict:
+        """Страница выдачи для подбора и диагностики (без прокрутки)."""
+        if not self.use_session:
+            return self.repo.fetch_search_raw(query=query, url=url)
+        page_url = url or OzonRepository.search_url_from_query(query)
+        return self._listing_in_session(page_url, scroll_steps=0)
+
     # ------------------------------------------------------------------ #
     def get_card(self, url: str) -> dict:
         """Полный разбор: вернуть структурированную карточку + debug-файлы."""
         t0 = time.monotonic()
-        logger.info("get_card: старт, url=%s", url)
-        try:
-            raw = self.repo.fetch_raw(url)
-        except AntibotBlockedError as exc:
-            self._emit_blocked(url, exc)
-            raise
+        logger.info("get_card: старт, url=%s (сессия=%s)", url, self.use_session)
+        with self._lock:
+            try:
+                raw = self._fetch_raw(url)
+            except OutOfStockError:
+                if not self.use_session:
+                    raise
+                # Товар закончился (Ozon увёл на поиск) - не бан, карточка с нашим sku
+                card = OzonCard(
+                    sku=OzonParser._sku_from_url(url), url=url,
+                    parsed_at=datetime.now(timezone.utc).isoformat(timespec="seconds"),
+                    button_state="out_of_stock",
+                )
+                logger.info("get_card: товар закончился, sku=%s", card.sku)
+                return {"card": card.model_dump(), "debug_files": None}
+            except AntibotBlockedError as exc:
+                self._emit_blocked(url, exc)
+                raise
         card = build_card(raw["html"], raw["nuxt_state"], raw["url"])
         card_dict = card.model_dump()
         files = self._save_debug(self._basename(raw["url"]), raw, card_dict)
@@ -96,12 +171,13 @@ class OzonService:
     def get_raw(self, url: str) -> dict:
         """Только сырьё: вернуть __NUXT__ JSON + debug-файлы."""
         t0 = time.monotonic()
-        logger.info("get_raw: старт, url=%s", url)
-        try:
-            raw = self.repo.fetch_raw(url)
-        except AntibotBlockedError as exc:
-            self._emit_blocked(url, exc)
-            raise
+        logger.info("get_raw: старт, url=%s (сессия=%s)", url, self.use_session)
+        with self._lock:
+            try:
+                raw = self._fetch_raw(url)
+            except AntibotBlockedError as exc:
+                self._emit_blocked(url, exc)
+                raise
         sku = OzonRepository.sku_from_url(raw["url"])
         files = self._save_debug(self._basename(raw["url"]), raw, None)
         took = round(time.monotonic() - t0, 2)
@@ -187,8 +263,9 @@ class OzonService:
         return self.get_card_for_crawl(OzonRepository.url_from_sku(sku))
 
     def close_crawl(self) -> None:
-        """Публичное закрытие сессии обхода (для остановки воркера)."""
-        self._close_crawl_session()
+        """Публичное закрытие сессии (остановка воркера или API)."""
+        with self._lock:
+            self._close_crawl_session()
 
     # ------------------------------------------------------------------ #
     def _emit_blocked(self, url: str, exc: AntibotBlockedError) -> None:
@@ -197,8 +274,6 @@ class OzonService:
 
         Сейчас событие уходит в Kafka через emit_event (при KAFKA_ENABLED=false
         просто пишется в лог уровня WARNING и дальше не идёт — мягкая деградация).
-        Когда брокер подключат, эти же события начнут собираться для анализа
-        неслучайности пропусков (какие товары/когда чаще блокируются).
         """
         sku = OzonRepository.sku_from_url(url)
         logger.warning("Антибот заблокировал парсинг: url=%s sku=%s", url, sku)
@@ -220,11 +295,12 @@ class OzonService:
                 f"Некорректный URL категории Ozon: {url!r}", marketplace="ozon"
             )
 
-        try:
-            raw = self.repo.fetch_raw(url)
-        except AntibotBlockedError as exc:
-            self._emit_blocked(url, exc)
-            raise
+        with self._lock:
+            try:
+                raw = self._fetch_raw(url)
+            except AntibotBlockedError as exc:
+                self._emit_blocked(url, exc)
+                raise
 
         data = raw["nuxt_state"]
         result = self._extract_category_info(data)
@@ -294,18 +370,18 @@ class OzonService:
         return self.get_category_info(self.category_url_from_id(category_id))
 
     def search_diagnostics(self, query: str, count: int) -> dict:
-        """Дагностика сбора сета: открыть первую страницу выдачи, извлечь кандидатов, отфильтровать."""
+        """Диагностика сбора сета: открыть первую страницу выдачи, извлечь кандидатов, отфильтровать."""
         from app.marketplaces.ozon.search_listing import extract_candidates, prefilter
-        try:
-            raw = self.repo.fetch_search_raw(query=query)
-        except AntibotBlockedError as exc:
-            self._emit_blocked(query, exc)
-            raise
+        with self._lock:
+            try:
+                raw = self._fetch_listing(query=query)
+            except AntibotBlockedError as exc:
+                self._emit_blocked(query, exc)
+                raise
         cands = extract_candidates(raw["html"])
         pf = prefilter(cands, [], self.policy.min_rating, self.policy.min_reviews)
         files = {}
         if settings.debug:
-            import os
             os.makedirs(settings.debug_dir, exist_ok=True)
             p = os.path.join(settings.debug_dir,
                              f"search_{datetime.now():%Y%m%d_%H%M%S}.html")
@@ -317,11 +393,60 @@ class OzonService:
                 "next_page": raw["next_page"],
                 "candidates": [c.model_dump() for c in pf], "debug_files": files or None}
 
+    def _tiles_in_session(self, page_url: str, target: int) -> dict:
+        """Выдача в долгоживущей сессии: переход, прокрутка до target плиток,
+        сбор отрисованных плиток. {raw_tiles, scrolls, html, url, screenshot_png}."""
+        self._ensure_crawl_session()
+        parser = self._crawl_parser
+        try:
+            parser.fetch_listing_scrolled(page_url, 0)
+            raw_tiles, scrolls = parser.scroll_collect_tiles(target, self.policy.search_max_scrolls)
+            html = parser.driver.page_source
+            png = parser.screenshot_png()
+        except AntibotBlockedError:
+            self._close_crawl_session()
+            raise
+        finally:
+            parser.consume_session_step()
+        return {"raw_tiles": raw_tiles, "scrolls": scrolls, "html": html,
+                "url": page_url, "screenshot_png": png}
+
+    def search_tiles(self, query: str, target: int | None = None) -> dict:
+        """Снимок выдачи: плитки с позициями, в карточки не заходим.
+        HTML и скриншот сохраняются всегда."""
+        from app.marketplaces.ozon.search_listing import parse_tiles
+        target = target or self.policy.search_tiles_target
+        page_url = OzonRepository.search_url_from_query(query)
+        with self._lock:
+            try:
+                raw = self._tiles_in_session(page_url, target)
+            except AntibotBlockedError as exc:
+                self._emit_blocked(query, exc)
+                raise
+
+        tiles = [t.model_dump() for t in parse_tiles(raw["raw_tiles"], target)]
+
+        os.makedirs(settings.debug_dir, exist_ok=True)
+        base = f"search_tiles_{datetime.now():%Y%m%d_%H%M%S}"
+        files: dict[str, str] = {}
+        with open(os.path.join(settings.debug_dir, f"{base}.html"), "w", encoding="utf-8") as f:
+            f.write(raw["html"])
+        files["html"] = f"{base}.html"
+        if raw.get("screenshot_png"):
+            with open(os.path.join(settings.debug_dir, f"{base}.png"), "wb") as f:
+                f.write(raw["screenshot_png"])
+            files["png"] = f"{base}.png"
+
+        logger.info("search_tiles: query=%r плиток на странице=%s, взято=%s, прокруток=%s",
+                    query, len(raw["raw_tiles"]), len(tiles), raw["scrolls"])
+        return {"query": query, "url": raw["url"], "scrolls": raw["scrolls"],
+                "tiles_total": len(tiles), "tiles": tiles, "debug_files": files}
+
     def select_for_stratum(self, req) -> dict:
         """
         Подбор карточек под страту. Категорийная логика — в стратегии
         (app/categories), оркестрация — в selection.select_cards,
-        карточки берутся существующим get_card (тот же путь, что card/by-url).
+        карточки берутся get_card (тот же путь, что card/by-url).
         """
         from app.categories.registry import get_strategy
 
@@ -335,20 +460,19 @@ class OzonService:
 
         def fetch_page(url):
             # первая страница — по query (url=None), следующие — по nextPage
-            return self.repo.fetch_search_raw(query=req.query if url is None else None, url=url)
+            return self._fetch_listing(query=req.query if url is None else None, url=url)
 
         def get_card_only(card_url):
             res = self.get_card(card_url)
-            from app.marketplaces.ozon.models import OzonCard
             return OzonCard(**res["card"])
 
-        result = select_cards(
-            req,
-            fetch_page=fetch_page,
-            get_card=get_card_only,
-            min_rating=min_rating,
-            min_reviews=min_reviews,
-            max_pages=self.policy.max_pages,
-            strategy=strategy,
-        )
-        return result
+        with self._lock:
+            return select_cards(
+                req,
+                fetch_page=fetch_page,
+                get_card=get_card_only,
+                min_rating=min_rating,
+                min_reviews=min_reviews,
+                max_pages=self.policy.max_pages,
+                strategy=strategy,
+            )

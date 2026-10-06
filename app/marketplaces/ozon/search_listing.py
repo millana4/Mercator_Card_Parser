@@ -73,21 +73,11 @@ def _slug_from_link(link: str) -> tuple[str | None, str | None]:
     slug = m.group(1) if m else None
     return url, slug
 
-def extract_candidates(html: str) -> list[Candidate]:
-    """
-    Разобрать HTML страницы выдачи Ozon в список кандидатов.
-    Источник — виджет tileGridDesktop (плитки товаров).
-    Дедуплицирует по артикулу в рамках одного вызова (дубли листинга).
-    """
-    st = _tilegrid_state(html)
-    if not st or "items" not in st:
-        logger.warning("extract_candidates: виджет плиток не найден или пуст")
-        return []
-
+def _candidates_from_state(st: dict, seen: set[str]) -> list[Candidate]:
+    """Плитки одного виджета выдачи -> кандидаты. seen - уже встреченные sku
+    (дубли листинга и плитки из соседних виджетов пропускаются)."""
     out: list[Candidate] = []
-    seen: set[str] = set()
-
-    for it in st["items"]:
+    for it in st.get("items", []):
         sku = str(it.get("sku") or it.get("id") or "").strip()
         if not sku or sku in seen:
             continue
@@ -132,7 +122,20 @@ def extract_candidates(html: str) -> list[Candidate]:
             price=price, original_price=original,
             rating=rating, reviews=reviews, is_original=is_original,
         ))
+    return out
 
+
+def extract_candidates(html: str) -> list[Candidate]:
+    """
+    Разобрать HTML страницы выдачи Ozon в список кандидатов.
+    Источник — первый виджет tileGridDesktop (плитки, пришедшие со страницей).
+    Дедуплицирует по артикулу в рамках одного вызова (дубли листинга).
+    """
+    st = _tilegrid_state(html)
+    if not st or "items" not in st:
+        logger.warning("extract_candidates: виджет плиток не найден или пуст")
+        return []
+    out = _candidates_from_state(st, set())
     logger.info("extract_candidates: получено %s кандидатов", len(out))
     return out
 
@@ -269,3 +272,144 @@ def build_next_page_url(current_url: str, current_page: int) -> str:
     qs = parse_qs(parsed.query, keep_blank_values=True)
     qs["page"] = [str(current_page + 1)]
     return urlunparse(parsed._replace(query=urlencode(qs, doseq=True)))
+
+
+# ---------- Плитки выдачи из отрисованной страницы ----------
+# Ozon кладёт в data-state только первые 8 плиток, остальные дорисовывает скриптом.
+# Плитка разбирается по тексту: классы в разметке зашифрованы и меняются.
+
+class SearchTile(BaseModel):
+    """Плитка поисковой выдачи (в карточку не заходим)."""
+    position: int = Field(..., description="Позиция в выдаче, начиная с 1")
+    sku: str = Field(..., description="Артикул")
+    url: str | None = Field(None, description="URL карточки (без query-хвоста)")
+    name: str | None = Field(None, description="Название с плитки")
+    brand: str | None = Field(None, description="Бренд, если показан на плитке")
+    brand_verified: bool = Field(False, description="Отметка «Бренд проверен»")
+    price: float | None = Field(None, description="Цена, руб.")
+    original_price: float | None = Field(None, description="Зачёркнутая цена, руб.")
+    discount_pct: int | None = Field(None, description="Скидка с плитки, %")
+    quantity: int | None = Field(None, description="Остаток с плитки («51 ед осталось»)")
+    rating: float | None = Field(None, description="Рейтинг")
+    reviews: int | None = Field(None, description="Число отзывов")
+    badges: list[str] = Field(default_factory=list, description="Промо-бейджи («Скидки недели»)")
+    labels: list[str] = Field(default_factory=list,
+                              description="Прочие метки плитки: известные («Стало дешевле») и после рейтинга («Ozon»)")
+
+
+_NUM_SPACES = "\u00a0\u2009\u202f "
+_PRICE_RE = re.compile(r"^[\d" + _NUM_SPACES + r"]+₽$")
+_DISCOUNT_RE = re.compile(r"^[−\-–]\s?(\d{1,3})\s?%$")
+_STOCK_LEFT_RE = re.compile(r"(\d[\d" + _NUM_SPACES + r"]*)\s*(?:ед\.?|шт\.?)\s*остал", re.IGNORECASE)
+_LEFT_STOCK_RE = re.compile(r"остал\w*\s+(\d[\d" + _NUM_SPACES + r"]*)\s*(?:ед\.?|шт\.?)", re.IGNORECASE)
+_RATING_RE = re.compile(r"^\d[.,]\d$")
+_REVIEWS_RE = re.compile(r"^(\d[\d" + _NUM_SPACES + r"]*)\s*отзыв", re.IGNORECASE)
+_BARE_NUM_RE = re.compile(r"^\d[\d" + _NUM_SPACES + r"]*$")
+_SKU_FROM_HREF_RE = re.compile(r"/product/(?:[^/]*-)?(\d+)/?$")
+BRAND_VERIFIED = "Бренд проверен"
+# Метки Ozon, которые стоят на месте бренда (между ценой и названием) - узнаём по тексту.
+# Новая метка, встреченная в данных, добавляется сюда.
+KNOWN_LABELS = frozenset({"Стало дешевле"})
+
+
+def _digits(text: str) -> int:
+    return int(re.sub(r"\D", "", text))
+
+
+def _stock_left(text: str) -> int | None:
+    """«51 ед осталось» / «Осталась 1 шт» -> число; иначе None."""
+    m = _STOCK_LEFT_RE.search(text) or _LEFT_STOCK_RE.search(text)
+    return _digits(m.group(1)) if m else None
+
+
+def parse_tile(href: str | None, texts: list[str], position: int) -> SearchTile | None:
+    """Плитка: ссылка + текстовые фрагменты по порядку -> SearchTile.
+    До первой цены - бейджи; после цены до рейтинга - бренд и название
+    (название - последний фрагмент); после рейтинга - отзывы и метки.
+    None - в ссылке нет артикула (не плитка товара)."""
+    path = (href or "").split("?")[0]
+    m = _SKU_FROM_HREF_RE.search(path)
+    if not m:
+        return None
+    url, _ = _slug_from_link(href or "")
+
+    prices: list[float] = []
+    discount = quantity = reviews = None
+    rating = None
+    brand = None
+    brand_verified = False
+    badges: list[str] = []
+    body: list[str] = []      # после цены до рейтинга: бренд, название
+    labels: list[str] = []    # после рейтинга
+    after_rating = False
+
+    for raw in texts:
+        t = (raw or "").strip()
+        if not t:
+            continue
+        if _PRICE_RE.match(t):
+            prices.append(_clean_num(t))
+            continue
+        md = _DISCOUNT_RE.match(t)
+        if md:
+            discount = int(md.group(1))
+            continue
+        q = _stock_left(t)
+        if q is not None:
+            quantity = q
+            continue
+        if t in KNOWN_LABELS:
+            labels.append(t)
+            continue
+        if t == BRAND_VERIFIED:
+            brand_verified = True
+            # бренд, если показан, стоит прямо перед отметкой; название идёт после неё
+            if body and brand is None:
+                brand = body.pop()
+            continue
+        if prices and rating is None and _RATING_RE.match(t):
+            rating = float(t.replace(",", "."))
+            after_rating = True
+            continue
+        mr = _REVIEWS_RE.match(t)
+        if mr:
+            reviews = _digits(mr.group(1))
+            continue
+        if after_rating and reviews is None and _BARE_NUM_RE.match(t):
+            reviews = _digits(t)          # «2» без слова «отзыва»
+            continue
+        if not prices:
+            badges.append(t)
+        elif after_rating:
+            labels.append(t)
+        else:
+            body.append(t)
+
+    if brand is None and len(body) >= 2:
+        brand = body[-2]                  # бренд без отметки - прямо перед названием
+
+    return SearchTile(
+        position=position, sku=m.group(1), url=url,
+        name=body[-1] if body else None,
+        brand=brand, brand_verified=brand_verified,
+        price=prices[0] if prices else None,
+        original_price=prices[1] if len(prices) > 1 else None,
+        discount_pct=discount, quantity=quantity,
+        rating=rating, reviews=reviews, badges=badges, labels=labels,
+    )
+
+
+def parse_tiles(raw_tiles: list[dict], limit: int) -> list[SearchTile]:
+    """Плитки страницы [{href, texts}] в порядке на странице -> не больше limit
+    плиток. Позиция = номер плитки на странице; повторный sku пропускается."""
+    out: list[SearchTile] = []
+    seen: set[str] = set()
+    for i, rt in enumerate(raw_tiles, start=1):
+        tile = parse_tile(rt.get("href"), rt.get("texts") or [], i)
+        if tile is None or tile.sku in seen:
+            continue
+        seen.add(tile.sku)
+        out.append(tile)
+        if len(out) >= limit:
+            break
+    return out

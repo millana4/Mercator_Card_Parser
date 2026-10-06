@@ -10,7 +10,7 @@ ozon.py — маршруты Ozon.
   7. POST /ozon/raw/by-id          — сырой __NUXT__ по артикулу
   8. POST /ozon/search/diagnostics — диагностика поисковой выдачи (служебный)
 """
-
+import threading
 from fastapi import APIRouter, Depends
 
 from app.api.dependencies import verify_api_key
@@ -20,7 +20,7 @@ from app.marketplaces.ozon.service import OzonService
 from app.marketplaces.ozon.schemas import (
     ParseByUrlRequest, ParseByIdRequest, CardResponse, RawResponse,
     CategoryInfoResponse, CategoryInfoByIdRequest, CategoryInfoByUrlRequest, SearchDiagRequest, SearchDiagResponse,
-    SelectionResponse,
+    SelectionResponse, SearchTilesRequest, SearchTilesResponse,
 )
 
 logger = get_logger(__name__)
@@ -28,9 +28,25 @@ logger = get_logger(__name__)
 router = APIRouter(prefix="/ozon", tags=["Ozon"])
 
 
+_service: OzonService | None = None
+_service_lock = threading.Lock()
+
+
 def get_service() -> OzonService:
-    """Фабрика сервиса (можно подменить в тестах)."""
-    return OzonService()
+    """Один сервис на процесс API с долгоживущей сессией браузера (как у воркера):
+    главная, переходы изнутри Ozon, браузер переживает запросы."""
+    global _service
+    with _service_lock:
+        if _service is None:
+            _service = OzonService(use_session=True)
+        return _service
+
+
+def shutdown_service() -> None:
+    """Закрыть браузер при остановке API."""
+    with _service_lock:
+        if _service is not None:
+            _service.close_crawl()
 
 
 @router.post("/card/by-url", response_model=CardResponse,
@@ -135,3 +151,12 @@ def search_diagnostics(req: SearchDiagRequest,
         extracted=r["extracted"], after_prefilter=r["after_prefilter"],
         candidates=r["candidates"], debug_files=r["debug_files"],
     )
+
+
+@router.post("/search/tiles", response_model=SearchTilesResponse,
+             summary="Снимок выдачи: плитки с позициями, ценой, скидкой, остатком")
+def search_tiles(req: SearchTilesRequest,
+                 _: dict = Depends(verify_api_key),
+                 service: OzonService = Depends(get_service)):
+    logger.info("POST /ozon/search/tiles query=%r target=%s", req.query, req.target)
+    return SearchTilesResponse(**service.search_tiles(req.query, req.target))

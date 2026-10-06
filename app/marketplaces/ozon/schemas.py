@@ -104,3 +104,25 @@ class SelectionResponse(BaseModel):
                                   description="Полные карточки подобранных товаров")
     requested_count: int = Field(..., description="Сколько запрашивалось (count)")
     found_count: int = Field(..., description="Сколько реально подобрано (может быть меньше)")
+
+
+# ============================================================================ #
+#  Снимок поисковой выдачи                                                     #
+# ============================================================================ #
+from app.marketplaces.ozon.search_listing import SearchTile  # noqa: E402
+
+
+class SearchTilesRequest(BaseModel):
+    query: str = Field(..., description="Поисковый запрос страты", examples=["Лонгслив для девочки"])
+    target: int | None = Field(None, ge=1, le=100,
+                               description="Сколько плиток набрать; пусто - OZON_SEARCH_TILES_TARGET")
+
+
+class SearchTilesResponse(BaseModel):
+    ok: bool = True
+    query: str
+    url: str
+    scrolls: int = Field(..., description="Сколько раз прокручена выдача")
+    tiles_total: int
+    tiles: list[SearchTile] = Field(default_factory=list)
+    debug_files: dict[str, str] = Field(default_factory=dict)

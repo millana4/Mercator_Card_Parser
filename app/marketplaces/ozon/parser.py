@@ -21,6 +21,7 @@ import os
 from selenium import webdriver
 from selenium.webdriver.common.by import By
 from selenium.webdriver.support.ui import WebDriverWait
+from selenium.webdriver.support import expected_conditions as ec
 from selenium.webdriver.chrome.options import Options
 from selenium.webdriver.chrome.service import Service
 from selenium_stealth import stealth
@@ -196,8 +197,10 @@ class OzonParser:
         except Exception:
             return False
 
-        # 1. Быстрая проверка по заголовку и URL (ловит 99% капч)
-        if "Antibot Captcha" in title or "__rr=1" in cur_url:
+        # 1. Быстрая проверка по заголовку. __rr=1 в адресе ставится и на обычную
+        #    страницу после прохождения проверки защиты (заголовок при этом Ozon),
+        #    поэтому сам по себе он признаком блокировки не считается.
+        if "Antibot Captcha" in title or ("__rr=1" in cur_url and "Ozon" not in title):
             logger.warning("Обнаружена капча/блокировка (title=%r, url=%r)", title, cur_url)
             return True
 
@@ -386,6 +389,83 @@ class OzonParser:
                                           self.policy.retry_pause_max))
         logger.warning("Плитки не появились после всех попыток")
         return self.driver.page_source
+
+
+    def fetch_listing_scrolled(self, url: str, scroll_steps: int) -> str:
+        """Выдача как у живого покупателя: (главная, если браузер не на Ozon) ->
+        переход на поиск изнутри Ozon (браузер ставит Referer) -> ожидание новой
+        страницы и плиток -> прокрутка scroll_steps раз, Ozon догружает плитки.
+        В карточки не заходим. Возвращает HTML страницы."""
+        self.driver.set_page_load_timeout(self.policy.page_load_timeout)
+        try:
+            cur = self.driver.current_url or ""
+        except Exception:
+            cur = ""
+        if "ozon.ru" not in cur:
+            self.visit_home()
+
+        logger.info("Выдача с прокруткой (шагов %s): %s", scroll_steps, url)
+        old_root = self.driver.find_element(By.TAG_NAME, "html")
+        self.driver.execute_script("window.location.assign(arguments[0]);", url)
+        try:
+            WebDriverWait(self.driver, self.policy.page_load_timeout).until(ec.staleness_of(old_root))
+        except Exception:
+            logger.warning("Переход на выдачу не подтвердился за %s сек", self.policy.page_load_timeout)
+
+        if self._is_blocked():
+            raise AntibotBlockedError("Выдача заблокирована антиботом.", marketplace="ozon")
+        try:
+            self.wait.until(lambda d: "tileGridDesktop" in d.page_source)
+        except Exception:
+            logger.warning("Плитки не появились за %s сек", self.policy.wait_timeout)
+            if self._is_blocked():
+                raise AntibotBlockedError("Выдача заблокирована антиботом.", marketplace="ozon")
+
+        self._pause()
+        for step in range(scroll_steps):
+            self.driver.execute_script(f"window.scrollBy(0, {random.randint(1400, 2000)});")
+            time.sleep(random.uniform(2.0, 4.0))
+            logger.debug("Прокрутка выдачи: шаг %s/%s", step + 1, scroll_steps)
+        return self.driver.page_source
+
+
+    # Ссылка и текстовые фрагменты каждой отрисованной плитки, в порядке на странице
+    _TILES_JS = """
+        return Array.from(document.querySelectorAll('.tile-root')).map(function (el) {
+            var a = el.querySelector('a[href*="/product/"]');
+            var walker = document.createTreeWalker(el, NodeFilter.SHOW_TEXT);
+            var texts = [], node;
+            while ((node = walker.nextNode())) {
+                var s = node.nodeValue.trim();
+                if (s) texts.push(s);
+            }
+            return {href: a ? a.getAttribute('href') : null, texts: texts};
+        });
+    """
+
+    def collect_tiles(self) -> list[dict]:
+        """Отрисованные плитки выдачи: [{href, texts}]."""
+        try:
+            return self.driver.execute_script(self._TILES_JS) or []
+        except Exception as e:
+            logger.warning("Не удалось собрать плитки со страницы: %s", e)
+            return []
+
+    def scroll_collect_tiles(self, target: int, max_scrolls: int) -> tuple[list[dict], int]:
+        """Прокручивать выдачу, пока плиток меньше target, не больше max_scrolls раз;
+        2 прокрутки подряд без новых плиток - выдача кончилась.
+        Возвращает (плитки, сделано прокруток)."""
+        tiles = self.collect_tiles()
+        scrolls = stale = 0
+        while len(tiles) < target and scrolls < max_scrolls and stale < 2:
+            self.driver.execute_script(f"window.scrollBy(0, {random.randint(1400, 2000)});")
+            time.sleep(random.uniform(2.0, 4.0))
+            scrolls += 1
+            fresh = self.collect_tiles()
+            stale = stale + 1 if len(fresh) <= len(tiles) else 0
+            tiles = fresh
+        logger.info("Плиток на странице %s (нужно %s), прокруток %s", len(tiles), target, scrolls)
+        return tiles, scrolls
 
 
     @staticmethod

@@ -67,6 +67,8 @@ class MarketplacePolicy:
     min_reviews: int                    # порог отбора: мин. число отзывов (строго больше) при подборе
     pool_multiplier: int                # подбор: собирать пул кандидатов = нужно × этот множитель
     max_pages: int                      # подбор: потолок прокруток страницы выдачи
+    search_tiles_target: int = 32       # снимок выдачи: сколько плиток набирать прокруткой
+    search_max_scrolls: int = 10        # снимок выдачи: потолок прокруток
 
 
 class Settings:
@@ -103,6 +105,8 @@ class Settings:
             min_reviews=_get_int("OZON_MIN_REVIEWS", 30),
             pool_multiplier=_get_int("OZON_POOL_MULTIPLIER", 3),
             max_pages=_get_int("OZON_MAX_PAGES", 10),
+            search_tiles_target=_get_int("OZON_SEARCH_TILES_TARGET", 32),
+            search_max_scrolls=_get_int("OZON_SEARCH_MAX_SCROLLS", 10),
         )
 
 
