@@ -411,9 +411,9 @@ class OzonService:
         return {"raw_tiles": raw_tiles, "scrolls": scrolls, "html": html,
                 "url": page_url, "screenshot_png": png}
 
-    def search_tiles(self, query: str, target: int | None = None) -> dict:
+    def search_tiles(self, query: str, target: int | None = None, save_files: bool = True) -> dict:
         """Снимок выдачи: плитки с позициями, в карточки не заходим.
-        HTML и скриншот сохраняются всегда."""
+        save_files - сохранить HTML и скриншот (Swagger - всегда, воркер - при DEBUG)."""
         from app.marketplaces.ozon.search_listing import parse_tiles
         target = target or self.policy.search_tiles_target
         page_url = OzonRepository.search_url_from_query(query)
@@ -426,16 +426,17 @@ class OzonService:
 
         tiles = [t.model_dump() for t in parse_tiles(raw["raw_tiles"], target)]
 
-        os.makedirs(settings.debug_dir, exist_ok=True)
-        base = f"search_tiles_{datetime.now():%Y%m%d_%H%M%S}"
         files: dict[str, str] = {}
-        with open(os.path.join(settings.debug_dir, f"{base}.html"), "w", encoding="utf-8") as f:
-            f.write(raw["html"])
-        files["html"] = f"{base}.html"
-        if raw.get("screenshot_png"):
-            with open(os.path.join(settings.debug_dir, f"{base}.png"), "wb") as f:
-                f.write(raw["screenshot_png"])
-            files["png"] = f"{base}.png"
+        if save_files:
+            os.makedirs(settings.debug_dir, exist_ok=True)
+            base = f"search_tiles_{datetime.now():%Y%m%d_%H%M%S}"
+            with open(os.path.join(settings.debug_dir, f"{base}.html"), "w", encoding="utf-8") as f:
+                f.write(raw["html"])
+            files["html"] = f"{base}.html"
+            if raw.get("screenshot_png"):
+                with open(os.path.join(settings.debug_dir, f"{base}.png"), "wb") as f:
+                    f.write(raw["screenshot_png"])
+                files["png"] = f"{base}.png"
 
         logger.info("search_tiles: query=%r плиток на странице=%s, взято=%s, прокруток=%s",
                     query, len(raw["raw_tiles"]), len(tiles), raw["scrolls"])

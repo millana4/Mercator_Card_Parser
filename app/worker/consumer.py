@@ -21,7 +21,7 @@ from app.core.logging import get_logger
 from app.marketplaces.ozon.service import OzonService
 from app.worker.redis_config import redis_worker_settings as rws
 from app.worker.result_producer import ResultProducer
-from app.worker.handlers import handle_select, handle_parse
+from app.worker.handlers import handle_select, handle_parse, handle_search
 
 logger = get_logger(__name__)
 
@@ -122,6 +122,9 @@ class TaskConsumer:
         if stream == "select":
             result = handle_select(task, self.service)
             result_key = rws.select_results_key(marketplace)
+        elif stream == "search":
+            result = handle_search(task, self.service)
+            result_key = rws.search_results_key(marketplace)
         else:
             result = handle_parse(task, self.service)
             result_key = rws.parse_results_key(marketplace)
@@ -138,14 +141,18 @@ class TaskConsumer:
                          result.get("task_id"))
             return
 
-        # Счётчики наблюдаемости — свои на каждую площадку.
-        if result.get("error_code") == "antibot_blocked":
+        # Счётчики наблюдаемости — свои на каждую площадку; у снимков выдачи - отдельные.
+        antibot = result.get("error_code") == "antibot_blocked"
+        if stream == "search":
+            self.producer.incr_counter(rws.counter_search_antibot(marketplace) if antibot
+                                       else rws.counter_search_done(marketplace))
+        elif antibot:
             self.producer.incr_counter(rws.counter_antibot(marketplace))
         else:
             self.producer.incr_counter(rws.counter_done(marketplace))
 
-        # Реакция на антибот — только для задач обхода.
-        if stream == "parse":
+        # Реакция на антибот — обход и снимок выдачи идут в одной сессии браузера.
+        if stream in ("parse", "search"):
             self._react_to_antibot(result)
 
         self._pause_between_cards()

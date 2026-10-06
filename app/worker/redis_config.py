@@ -48,6 +48,8 @@ class RedisWorkerSettings(BaseSettings):
     parse_results_prefix: str = Field(default="parse:results", alias="REDIS_PARSE_RESULTS_PREFIX")
     select_tasks_prefix: str = Field(default="select:tasks", alias="REDIS_SELECT_TASKS_PREFIX")
     select_results_prefix: str = Field(default="select:results", alias="REDIS_SELECT_RESULTS_PREFIX")
+    search_tasks_prefix: str = Field(default="search:tasks", alias="REDIS_SEARCH_TASKS_PREFIX")
+    search_results_prefix: str = Field(default="search:results", alias="REDIS_SEARCH_RESULTS_PREFIX")
 
     @field_validator("marketplaces_raw")
     @classmethod
@@ -76,13 +78,21 @@ class RedisWorkerSettings(BaseSettings):
     def parse_results_key(self, marketplace: str) -> str:
         return f"{self.parse_results_prefix}:{marketplace}:{self.geo_code}"
 
+    def search_tasks_key(self, marketplace: str) -> str:
+        return f"{self.search_tasks_prefix}:{marketplace}:{self.geo_code}"
+
+    def search_results_key(self, marketplace: str) -> str:
+        return f"{self.search_results_prefix}:{marketplace}:{self.geo_code}"
+
     @property
     def task_keys(self) -> list[str]:
-        """Ключи задач для BRPOP. Порядок = приоритет: сначала подбор по всем
-        площадкам, затем обход. Redis отдаёт из первого непустого ключа."""
+        """Ключи задач для BRPOP. Порядок = приоритет: подбор, снимок выдачи, обход.
+        Redis отдаёт из первого непустого ключа. Снимок выдачи стоит перед обходом:
+        в очереди обхода всегда есть буфер, иначе выдача не выполнилась бы никогда."""
         select_keys = [self.select_tasks_key(m) for m in self.marketplaces]
+        search_keys = [self.search_tasks_key(m) for m in self.marketplaces]
         parse_keys = [self.parse_tasks_key(m) for m in self.marketplaces]
-        return select_keys + parse_keys
+        return select_keys + search_keys + parse_keys
 
     @property
     def key_routes(self) -> dict[str, tuple[str, str]]:
@@ -91,6 +101,7 @@ class RedisWorkerSettings(BaseSettings):
         routes: dict[str, tuple[str, str]] = {}
         for m in self.marketplaces:
             routes[self.select_tasks_key(m)] = ("select", m)
+            routes[self.search_tasks_key(m)] = ("search", m)
             routes[self.parse_tasks_key(m)] = ("parse", m)
         return routes
 
@@ -100,6 +111,12 @@ class RedisWorkerSettings(BaseSettings):
 
     def counter_antibot(self, marketplace: str) -> str:
         return f"parser:{self.parser_id}:{marketplace}:antibot"
+
+    def counter_search_done(self, marketplace: str) -> str:
+        return f"parser:{self.parser_id}:{marketplace}:search_done"
+
+    def counter_search_antibot(self, marketplace: str) -> str:
+        return f"parser:{self.parser_id}:{marketplace}:search_antibot"
 
 
 redis_worker_settings = RedisWorkerSettings()
