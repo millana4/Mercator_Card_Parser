@@ -4,7 +4,8 @@ from app.worker.handlers import handle_search
 from app.worker.redis_config import RedisWorkerSettings
 
 TASK = {"task_id": "t-1", "set_id": "s-1", "stratum_id": "st-1", "geo": "Санкт-Петербург",
-        "marketplace": "ozon", "query": "Блузка для девочки"}
+        "marketplace": "ozon", "category": "kids_clothing", "query": "Блузка для девочки",
+        "run_at": "2026-10-06T18:37:00+03:00"}
 
 
 class FakeService:
@@ -34,6 +35,7 @@ def test_handle_search_ok_echoes_task():
     assert (r["task_id"], r["stratum_id"], r["query"]) == ("t-1", "st-1", "Блузка для девочки")
     assert r["tiles_total"] == 1 and r["tiles"][0]["sku"] == "123"
     assert r["parsed_at"]
+    assert (r["category"], r["run_at"]) == ("kids_clothing", "2026-10-06T18:37:00+03:00")
     assert svc.calls[0][:2] == ("Блузка для девочки", 20)
 
 

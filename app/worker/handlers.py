@@ -80,7 +80,9 @@ def handle_search(task: dict, service: OzonService) -> dict:
         "stratum_id": task.get("stratum_id"),
         "geo": task.get("geo"),
         "marketplace": task.get("marketplace"),
+        "category": task.get("category"),
         "query": task.get("query"),
+        "run_at": task.get("run_at"),
     }
     logger.info("SEARCH задача | task_id=%s set_id=%s stratum_id=%s query=%r",
                 echo["task_id"], echo["set_id"], echo["stratum_id"], echo["query"])
