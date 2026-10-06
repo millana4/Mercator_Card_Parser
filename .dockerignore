@@ -1,2 +1,5 @@
 app/chrome-profile/
 app/debug/
+
+app/wb-chrome-profile-api/
+app/wb-chrome-profile-worker/

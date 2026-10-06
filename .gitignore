@@ -19,3 +19,6 @@ venv/
 *.log
 .pytest_cache/
 app/chrome-profile/
+
+app/wb-chrome-profile-api/
+app/wb-chrome-profile-worker/

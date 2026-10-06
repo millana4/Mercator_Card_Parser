@@ -106,5 +106,31 @@ class Settings:
         )
 
 
+    def wb_policy(self) -> MarketplacePolicy:
+        """Политика Wildberries — все значения из env (WB_*), независимо от Ozon."""
+        return MarketplacePolicy(
+            headless=_get_bool("WB_HEADLESS", False),
+            page_load_timeout=_get_int("WB_PAGE_LOAD_TIMEOUT", 30),
+            wait_timeout=_get_int("WB_WAIT_TIMEOUT", 20),
+            pause_min=_get_float("WB_PAUSE_MIN", 3.0),
+            pause_max=_get_float("WB_PAUSE_MAX", 6.0),
+            retries=_get_int("WB_RETRIES", 2),
+            retry_pause_min=_get_float("WB_RETRY_PAUSE_MIN", 30.0),
+            retry_pause_max=_get_float("WB_RETRY_PAUSE_MAX", 60.0),
+            between_cards_min=_get_float("WB_BETWEEN_CARDS_MIN", 60.0),
+            between_cards_max=_get_float("WB_BETWEEN_CARDS_MAX", 80.0),
+            reserve_between_cards_min=_get_float("WB_RESERVE_BETWEEN_CARDS_MIN", 50.0),
+            reserve_between_cards_max=_get_float("WB_RESERVE_BETWEEN_CARDS_MAX", 80.0),
+            antibot_streak_threshold=_get_int("WB_ANTIBOT_STREAK_THRESHOLD", 3),
+            antibot_cooldown_s=_get_int("WB_ANTIBOT_COOLDOWN_S", 600),
+            session_min=_get_int("WB_SESSION_MIN", 20),
+            session_max=_get_int("WB_SESSION_MAX", 50),
+            min_rating=_get_float("WB_MIN_RATING", 4.8),
+            min_reviews=_get_int("WB_MIN_REVIEWS", 30),
+            pool_multiplier=_get_int("WB_POOL_MULTIPLIER", 3),
+            max_pages=_get_int("WB_MAX_PAGES", 10),
+        )
+
+
 # Единственный экземпляр настроек на весь сервис.
 settings = Settings()

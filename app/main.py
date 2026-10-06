@@ -15,7 +15,7 @@ from fastapi import FastAPI
 from app.core.config import settings
 from app.core.logging import setup_logging, get_logger
 from app.core.exceptions import register_exception_handlers
-from app.api.routes import ozon, files, health
+from app.api.routes import ozon, wb, files, health
 
 setup_logging()
 logger = get_logger(__name__)
@@ -32,6 +32,7 @@ register_exception_handlers(app)
 
 # Сначала маркетплейсы (вверху Swagger), затем служебные разделы.
 app.include_router(ozon.router, prefix=settings.api_prefix)
+app.include_router(wb.router, prefix=settings.api_prefix)
 app.include_router(files.router, prefix=settings.api_prefix)
 app.include_router(health.router, prefix=settings.api_prefix)
 

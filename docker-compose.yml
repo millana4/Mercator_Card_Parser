@@ -9,9 +9,11 @@ services:
     environment:
       - TZ=Europe/Moscow
       - OZON_CHROME_PROFILE_DIR=/app/chrome-profile
+      - WB_CHROME_PROFILE_DIR=/app/wb-chrome-profile
     volumes:
       - ./app/debug:/app/app/debug
       - ./app/chrome-profile:/app/chrome-profile
+      - ./app/wb-chrome-profile-api:/app/wb-chrome-profile
     extra_hosts:
       - "host.docker.internal:host-gateway"
     restart: unless-stopped
@@ -25,9 +27,11 @@ services:
     environment:
       - TZ=Europe/Moscow
       - OZON_CHROME_PROFILE_DIR=/app/chrome-profile
+      - WB_CHROME_PROFILE_DIR=/app/wb-chrome-profile
     volumes:
       - ./app/debug:/app/app/debug
       - ./app/chrome-profile:/app/chrome-profile
+      - ./app/wb-chrome-profile-worker:/app/wb-chrome-profile
     extra_hosts:
       - "host.docker.internal:host-gateway"
     restart: unless-stopped
