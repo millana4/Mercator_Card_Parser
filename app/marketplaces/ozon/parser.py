@@ -33,6 +33,9 @@ from app.marketplaces.ozon.nuxt import extract_nuxt_state
 
 logger = get_logger(__name__)
 
+# Маркер полного блока характеристик. Виджет приходит второй порцией страницы
+# (paginator, fetchType=scroll) — когда окно прокручено к концу загруженной части.
+FULL_CONTENT_MARKER = 'data-widget="webCharacteristics"'
 
 class OzonParser:
     """Драйвер + получение HTML + извлечение __NUXT__ для одной карточки Ozon."""
@@ -233,7 +236,44 @@ class OzonParser:
         return ('data-widget="error"' in src
                 or "Такой страницы не существует" in src)
 
-    def fetch_html(self, url: str) -> str:
+
+    def ensure_full_content(self) -> bool:
+        """
+        Дождаться полного блока характеристик (webCharacteristics).
+        Блок приходит второй порцией страницы при прокрутке к её концу. Если он
+        уже в разметке — выходим сразу, без прокрутки. Иначе прокручиваем вниз
+        с паузами, пока блок не появится или не выйдет policy.full_content_timeout.
+        На странице удалённого товара не ждём. Исключений не бросает.
+        Возвращает True, если блок в разметке есть.
+        """
+        timeout = self.policy.full_content_timeout
+        deadline = time.monotonic() + timeout
+        scrolls = 0
+        while True:
+            try:
+                src = self.driver.page_source
+            except Exception as e:
+                logger.warning("Не удалось прочитать страницу при ожидании полного блока: %s", e)
+                return False
+            if FULL_CONTENT_MARKER in src:
+                logger.info("Полный блок характеристик на странице (прокруток %s)", scrolls)
+                return True
+            if 'data-widget="error"' in src or "Такой страницы не существует" in src:
+                return False
+            if time.monotonic() >= deadline:
+                break
+            try:
+                self.driver.execute_script(f"window.scrollBy(0, {random.randint(800, 1400)});")
+            except Exception as e:
+                logger.warning("Прокрутка при ожидании полного блока не удалась: %s", e)
+                return False
+            scrolls += 1
+            time.sleep(random.uniform(1.0, 2.0))
+        logger.warning("Полный блок характеристик не появился за %s с (прокруток %s)",
+                       timeout, scrolls)
+        return False
+
+    def fetch_html(self, url: str, full_content: bool = False) -> str:
         """
         Открыть карточку с ретраями и вернуть HTML.
         Бросает AntibotBlockedError, если все попытки упёрлись в блок.
@@ -278,9 +318,12 @@ class OzonParser:
             try:
                 self.wait.until(lambda d: "__NUXT__" in d.page_source)
                 logger.info("Страница отдала __NUXT__ — данные получены")
+                if full_content:
+                    self.ensure_full_content()
                 return self.driver.page_source
             except Exception:
                 logger.warning("__NUXT__ не появился на попытке %s", attempt)
+
                 last_blocked = True
                 if attempt < self.policy.retries:
                     time.sleep(random.uniform(self.policy.retry_pause_min,
@@ -300,7 +343,7 @@ class OzonParser:
 
     # ------------------------------------------------------------------ #
 
-    def fetch_html_in_session(self, url: str) -> str:
+    def fetch_html_in_session(self, url: str, full_content: bool = False) -> str:
         """Открыть карточку в УЖЕ живом браузере (сессия переиспользуется)."""
         self.driver.set_page_load_timeout(self.policy.page_load_timeout)
         logger.info("Открываю карточку в сессии: %s", url)
@@ -333,6 +376,8 @@ class OzonParser:
         try:
             self.wait.until(lambda d: "__NUXT__" in d.page_source)
             logger.info("Страница отдала __NUXT__ — данные получены")
+            if full_content:
+                self.ensure_full_content()
             return self.driver.page_source
         except Exception:
             logger.warning("__NUXT__ не появился — считаю блокировкой")

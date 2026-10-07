@@ -55,15 +55,18 @@ def handle_parse(task: dict, service: OzonService) -> dict:
         "geo": task.get("geo"),
         "marketplace": task.get("marketplace"),
     }
-    logger.info("PARSE задача | task_id=%s card_id=%s sku=%s",
-                echo["task_id"], echo["card_id"], echo["sku"])
+    # Пометка «полный разбор»: дождаться полного блока характеристик
+    # (добор content_txt, референс ниши). Без пометки — обычный обход.
+    full_content = task.get("full_content") is True
+    logger.info("PARSE задача | task_id=%s card_id=%s sku=%s full_content=%s",
+                echo["task_id"], echo["card_id"], echo["sku"], full_content)
     sku = task.get("sku")
     if not sku:
         logger.warning("PARSE задача без sku | task_id=%s", echo["task_id"])
         return {**echo, "ok": False, "card": None,
                 "error": "В задаче отсутствует sku", "error_code": "invalid_request"}
     try:
-        result = service.get_card_for_crawl_by_id(str(sku))
+        result = service.get_card_for_crawl_by_id(str(sku), full_content=full_content)
         return {**echo, "ok": True, "card": result["card"], "error": None}
     except Exception as e:
         logger.exception("PARSE задача провалилась | task_id=%s sku=%s", echo["task_id"], sku)

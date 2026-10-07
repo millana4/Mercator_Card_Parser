@@ -84,19 +84,19 @@ class OzonService:
         return files
 
     # ================= Источник страниц: новый браузер или сессия ================= #
-    def _fetch_raw(self, url: str) -> dict:
+    def _fetch_raw(self, url: str, full_content: bool = False) -> dict:
         """Сырьё карточки/страницы {html, nuxt_state, screenshot_png, url, not_found}.
         В режиме сессии - через долгоживущий браузер; при антиботе сессия закрывается.
         OutOfStockError и AntibotBlockedError пробрасываются."""
         if not self.use_session:
-            return self.repo.fetch_raw(url)
+            return self.repo.fetch_raw(url, full_content=full_content)
         url = (url or "").strip()
         if not url:
             raise InvalidRequestError("Пустой URL", marketplace="ozon")
         self._ensure_crawl_session()
         parser = self._crawl_parser
         try:
-            html = parser.fetch_html_in_session(url)
+            html = parser.fetch_html_in_session(url, full_content=full_content)
         except AntibotBlockedError:
             self._close_crawl_session()
             raise
@@ -138,13 +138,14 @@ class OzonService:
         return self._listing_in_session(page_url, scroll_steps=0)
 
     # ------------------------------------------------------------------ #
-    def get_card(self, url: str) -> dict:
-        """Полный разбор: вернуть структурированную карточку + debug-файлы."""
+    def get_card(self, url: str, full_content: bool = True) -> dict:
+        """Полный разбор: вернуть структурированную карточку + debug-файлы.
+        full_content — дождаться полного блока характеристик (подбор и HTTP)."""
         t0 = time.monotonic()
         logger.info("get_card: старт, url=%s (сессия=%s)", url, self.use_session)
         with self._lock:
             try:
-                raw = self._fetch_raw(url)
+                raw = self._fetch_raw(url, full_content=full_content)
             except OutOfStockError:
                 if not self.use_session:
                     raise
@@ -214,7 +215,7 @@ class OzonService:
                 logger.debug("Ошибка закрытия сессии обхода: %s", e)
             self._crawl_parser = None
 
-    def get_card_for_crawl(self, url: str) -> dict:
+    def get_card_for_crawl(self, url: str, full_content: bool = False) -> dict:
         """Разобрать карточку в рамках долгоживущей сессии (путь ОБХОДА).
         Управляет сессией: заводит браузер, считает переходы, пересоздаёт по
         исчерпании. При антиботе закрывает сессию и пробрасывает исключение —
@@ -224,7 +225,7 @@ class OzonService:
         self._ensure_crawl_session()
         parser = self._crawl_parser
         try:
-            html = parser.fetch_html_in_session(url)
+            html = parser.fetch_html_in_session(url, full_content=full_content)
         except OutOfStockError:
             # Товар закончился — НЕ бан, сессию НЕ рвём. Карточку строим вручную
             # с нашим sku: build_card на HTML страницы поиска дал бы чужой sku
@@ -259,8 +260,8 @@ class OzonService:
                     took, card.sku, parser._session_left if parser else "-")
         return {"card": card_dict, "debug_files": None}
 
-    def get_card_for_crawl_by_id(self, sku: str) -> dict:
-        return self.get_card_for_crawl(OzonRepository.url_from_sku(sku))
+    def get_card_for_crawl_by_id(self, sku: str, full_content: bool = False) -> dict:
+        return self.get_card_for_crawl(OzonRepository.url_from_sku(sku), full_content=full_content)
 
     def close_crawl(self) -> None:
         """Публичное закрытие сессии (остановка воркера или API)."""

@@ -8,6 +8,10 @@ mapper.py — преобразование сырых данных страни�
   структурированных данных — именно HTML, а не __NUXT__.state (там в основном
   layout-структура и SEO).
 
+  Полный блок характеристик (webCharacteristics) и текст описания
+  (webDescription) в data-state не лежат — они есть только в отрисованной
+  разметке. Их разбираем по разметке виджета (data-widget="...").
+
   Дополнительно используем __NUXT__ (если передан) для категории/иерархии и
   как запасной источник sku/url.
 
@@ -17,10 +21,13 @@ mapper.py — преобразование сырых данных страни�
 import re
 import json
 import html as htmllib
+from html.parser import HTMLParser
 from app.core.logging import get_logger
 from datetime import datetime, timezone
 
-from app.marketplaces.ozon.models import OzonCard, OzonPrice, OzonSeller, OzonVariant, OzonLocation
+from app.marketplaces.ozon.models import (
+    OzonCard, OzonPrice, OzonSeller, OzonVariant, OzonLocation, OzonAspect, OzonAspectValue,
+)
 
 logger = get_logger(__name__)
 
@@ -74,6 +81,109 @@ def _rs_text(rs) -> str:
 
 
 # ----------------------------------------------------------------------------- #
+#  Вспомогательное: разбор отрисованной разметки одного виджета                  #
+# ----------------------------------------------------------------------------- #
+# Теги без закрывающей пары — не меняют глубину вложенности.
+_VOID_TAGS = frozenset({"area", "base", "br", "col", "embed", "hr", "img", "input",
+                        "link", "meta", "param", "source", "track", "wbr"})
+# Служебные теги внутри виджета: заголовок «Описание», кнопка «Показать полностью»,
+# иконки и скрипты. Их текст не берём.
+_SKIP_TAGS = frozenset({"h2", "button", "script", "style", "svg"})
+
+
+class _StopParsing(Exception):
+    """Виджет закрылся — дальше документ не читаем."""
+
+
+class _WidgetCollector(HTMLParser):
+    """
+    Читает разметку одного виджета data-widget="<имя>" и собирает:
+      pairs  — пары <dt>ключ</dt><dd>значение</dd> в порядке страницы;
+      blocks — текстовые фрагменты вне dt/dd и вне служебных тегов.
+    Текст внутри dt/dd склеивается без разделителя: значение вида
+    <a>В рубчик</a><span>, </span>Рюши даёт «В рубчик, Рюши».
+    """
+
+    def __init__(self, widget: str):
+        super().__init__(convert_charrefs=True)
+        self.widget = widget
+        self.inside = False
+        self.stack: list[str] = []
+        self.pairs: list[tuple[str, str]] = []
+        self.blocks: list[str] = []
+        self._field: str | None = None
+        self._buf: list[str] = []
+        self._dt: str | None = None
+
+    def handle_starttag(self, tag, attrs):
+        if not self.inside:
+            if dict(attrs).get("data-widget") == self.widget:
+                self.inside = True
+                self.stack = [tag]
+            return
+        if tag in _VOID_TAGS:
+            return
+        self.stack.append(tag)
+        if tag in ("dt", "dd"):
+            self._field = tag
+            self._buf = []
+
+    def handle_endtag(self, tag):
+        if not self.inside or tag not in self.stack:
+            return
+        while self.stack:
+            top = self.stack.pop()
+            if top == self._field:
+                self._close_field(top)
+            if top == tag:
+                break
+        if not self.stack:
+            raise _StopParsing
+
+    def handle_data(self, data):
+        if not self.inside or any(t in _SKIP_TAGS for t in self.stack):
+            return
+        if self._field:
+            self._buf.append(data)
+        elif data.strip():
+            self.blocks.append(_norm_space(data))
+
+    def _close_field(self, tag: str):
+        text = _norm_space("".join(self._buf))
+        if tag == "dt":
+            self._dt = text
+        elif self._dt:
+            self.pairs.append((self._dt, text))
+            self._dt = None
+        self._field = None
+        self._buf = []
+
+
+def _norm_space(text: str) -> str:
+    """Схлопнуть пробельные символы (в т.ч. неразрывные) в один пробел."""
+    return re.sub(r"\s+", " ", text).strip()
+
+
+def _collect_widget(html: str, widget: str) -> _WidgetCollector | None:
+    """
+    Разобрать разметку первого виджета data-widget="<widget>".
+    Чтение начинается с открывающего тега виджета и прекращается на его закрытии.
+    Возвращает None, если виджета в разметке нет.
+    """
+    idx = html.find(f'data-widget="{widget}"')
+    if idx < 0:
+        return None
+    start = html.rfind("<", 0, idx)
+    collector = _WidgetCollector(widget)
+    try:
+        collector.feed(html[start:])
+        collector.close()
+    except _StopParsing:
+        pass
+    return collector
+
+
+# ----------------------------------------------------------------------------- #
 #  Извлечение отдельных полей                                                    #
 # ----------------------------------------------------------------------------- #
 def _extract_variants(html: str) -> tuple[str | None, list[OzonVariant]]:
@@ -103,6 +213,39 @@ def _extract_variants(html: str) -> tuple[str | None, list[OzonVariant]]:
             price=_clean_price(data.get("price")),
         ))
     return aspect_name, variants
+
+
+def _extract_aspects(html: str) -> list[OzonAspect]:
+    """
+    Все переключатели вариантов из webAspects: обычно «Цвет» (type=colorsMix)
+    и «Размер» (type=sizes). У каждого значения свой sku; значение открытой
+    карточки помечено active=true.
+    """
+    st = _widget_state(html, "webAspects")
+    if not st:
+        return []
+    out: list[OzonAspect] = []
+    for asp in st.get("aspects", []):
+        values: list[OzonAspectValue] = []
+        for v in asp.get("variants", []):
+            data = v.get("data", {}) if isinstance(v.get("data"), dict) else {}
+            value = data.get("searchableText") or _rs_text(data.get("textRs", []))
+            raw_price = v.get("price") if v.get("price") is not None else data.get("price")
+            values.append(OzonAspectValue(
+                sku=str(v.get("sku")) if v.get("sku") else None,
+                value=value or None,
+                availability=v.get("availability"),
+                price=_clean_price(raw_price),
+                original_price=_clean_price(data.get("originalPrice")),
+                active=bool(v.get("active")),
+            ))
+        out.append(OzonAspect(
+            name=asp.get("aspectName"),
+            key=asp.get("aspectKey"),
+            type=asp.get("type"),
+            values=values,
+        ))
+    return out
 
 
 def _extract_quantity(html: str) -> int | None:
@@ -251,6 +394,41 @@ def _extract_characteristics(html: str) -> dict[str, str]:
     return out
 
 
+def _extract_characteristics_full(html: str) -> dict[str, str]:
+    """
+    Полный блок характеристик из разметки виджета webCharacteristics:
+      <dl><dt>Сезон</dt><dd>Демисезон</dd></dl> -> {'Сезон': 'Демисезон'}.
+    Все пары без отбора, в порядке страницы. Если ключ встречается повторно
+    с другим значением, значения склеиваются через запятую.
+    Пустой словарь — блока в разметке нет.
+    """
+    collector = _collect_widget(html, "webCharacteristics")
+    out: dict[str, str] = {}
+    if not collector:
+        return out
+    for key, value in collector.pairs:
+        if not key or not value:
+            continue
+        if key in out and out[key] != value:
+            out[key] = f"{out[key]}, {value}"
+        else:
+            out[key] = value
+    return out
+
+
+def _extract_tnved(characteristics_full: dict[str, str]) -> str | None:
+    """
+    Код ТН ВЭД из полного блока характеристик: ключ, содержащий «ТН ВЭД»
+    в любом написании (пробелы, дефис, точки, регистр). Возвращает только цифры
+    значения или None, если такого ключа нет или в значении нет цифр.
+    """
+    for key, value in characteristics_full.items():
+        if "ТНВЭД" in re.sub(r"[\s\-.]", "", key).upper():
+            digits = re.sub(r"\D", "", value)
+            return digits or None
+    return None
+
+
 def _extract_seller(html: str) -> OzonSeller:
     st = _widget_state(html, "webCurrentSeller")
     seller = OzonSeller()
@@ -330,10 +508,20 @@ def _ld_json(nuxt: dict | None) -> dict | None:
     return None
 
 
-def _extract_description(nuxt: dict | None) -> str | None:
+def _extract_description(nuxt: dict | None, html: str | None = None) -> str | None:
+    """
+    Описание товара. Основной источник — JSON-LD: там чистый текст с переносами
+    строк. В отрисованном виджете webDescription Ozon теряет часть слов
+    (например, предлоги), поэтому разметка — только запасной источник:
+    текстовые фрагменты виджета без заголовка и кнопки, через перенос строки.
+    """
     ld = _ld_json(nuxt)
     if ld and ld.get("description"):
         return ld["description"]
+    if html:
+        collector = _collect_widget(html, "webDescription")
+        if collector and collector.blocks:
+            return "\n".join(collector.blocks)
     return None
 
 
@@ -437,7 +625,7 @@ def build_card(html: str, nuxt_state: dict | None, url: str | None = None) -> Oz
     """
     Собирает структурированную OzonCard из HTML страницы и (опц.) __NUXT__.state.
 
-    html       — полный HTML карточки (там data-state виджетов);
+    html       — полный HTML карточки (там data-state виджетов и разметка);
     nuxt_state — словарь из __NUXT__.state (для SEO/категории/описания);
     url        — исходный URL (запасной источник sku).
     """
@@ -446,6 +634,7 @@ def build_card(html: str, nuxt_state: dict | None, url: str | None = None) -> Oz
     rating, reviews = _extract_rating_reviews(html, nuxt_state)
     category, category_path = _extract_category(nuxt_state)
     variants_aspect, variants = _extract_variants(html)
+    characteristics_full = _extract_characteristics_full(html)
     if 'data-widget="error"' in html or "Такой страницы не существует" in html:
         button_state = "not_found"
     else:
@@ -462,11 +651,15 @@ def build_card(html: str, nuxt_state: dict | None, url: str | None = None) -> Oz
         rating=rating,
         reviews_count=reviews,
         characteristics=_extract_characteristics(html),
-        description=_extract_description(nuxt_state),
+        characteristics_full=characteristics_full,
+        tnved=_extract_tnved(characteristics_full),
+        description=_extract_description(nuxt_state, html),
         category=category,
         category_path=category_path,
         variants_aspect=variants_aspect,
         variants=variants,
+        aspects=_extract_aspects(html),
+        full_content=bool(characteristics_full),
         seller=_extract_seller(html),
         location=_extract_location(nuxt_state),
         button_state=button_state,

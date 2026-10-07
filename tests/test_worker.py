@@ -42,7 +42,7 @@ class FakeService:
         return {"cards": [_FakeCard("1"), _FakeCard("2")],
                 "requested": req.count, "found": 2}
 
-    def get_card_for_crawl_by_id(self, sku):
+    def get_card_for_crawl_by_id(self, sku, full_content=False):
         if self.fail:
             raise RuntimeError("страница не грузится")
         return {"card": {"sku": sku, "name": "Рубашка Zella"}, "debug_files": None}

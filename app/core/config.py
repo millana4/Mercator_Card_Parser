@@ -69,6 +69,7 @@ class MarketplacePolicy:
     max_pages: int                      # подбор: потолок прокруток страницы выдачи
     search_tiles_target: int = 32       # снимок выдачи: сколько плиток набирать прокруткой
     search_max_scrolls: int = 10        # снимок выдачи: потолок прокруток
+    full_content_timeout: float = 15.0  # сек: сколько ждать полный блок характеристик при полном разборе
 
 
 class Settings:
@@ -107,6 +108,7 @@ class Settings:
             max_pages=_get_int("OZON_MAX_PAGES", 10),
             search_tiles_target=_get_int("OZON_SEARCH_TILES_TARGET", 32),
             search_max_scrolls=_get_int("OZON_SEARCH_MAX_SCROLLS", 10),
+            full_content_timeout=_get_float("OZON_FULL_CONTENT_TIMEOUT", 15.0),
         )
 
 

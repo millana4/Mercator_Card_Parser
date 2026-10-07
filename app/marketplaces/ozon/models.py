@@ -47,6 +47,24 @@ class OzonVariant(BaseModel):
     price: float | None = Field(None, description="Цена варианта (руб., число)")
 
 
+class OzonAspectValue(BaseModel):
+    """Одно значение переключателя вариантов: свой sku, доступность и цены."""
+    sku: str | None = Field(None, description="Артикул этого значения")
+    value: str | None = Field(None, description="Подпись значения (например, 'розовый', '128 RU / 128')")
+    availability: str | None = Field(None, description="Доступность (inStock/outOfStock)")
+    price: float | None = Field(None, description="Цена (руб., число)")
+    original_price: float | None = Field(None, description="Цена без скидки (руб., число)")
+    active: bool = Field(False, description="Значение открытой карточки")
+
+
+class OzonAspect(BaseModel):
+    """Переключатель вариантов из виджета webAspects (цвет, размер и т. п.)."""
+    name: str | None = Field(None, description="Название переключателя ('Цвет', 'Размер')")
+    key: str | None = Field(None, description="Ключ Ozon ('Color', 'size')")
+    type: str | None = Field(None, description="Тип переключателя ('colorsMix', 'sizes')")
+    values: list[OzonAspectValue] = Field(default_factory=list, description="Значения переключателя")
+
+
 class OzonCard(BaseModel):
     """
     Агрегированная карточка товара Ozon.
@@ -76,6 +94,17 @@ class OzonCard(BaseModel):
         description="Краткие характеристики товара: {название: значение}",
     )
 
+    # Полный блок характеристик (webCharacteristics) — все пары в порядке страницы,
+    # без отбора. Пусто, если блока нет в разметке.
+    characteristics_full: dict[str, str] = Field(
+        default_factory=dict,
+        description="Полные характеристики товара: {название: значение}",
+    )
+
+    # Код ТН ВЭД (только цифры) — из полного блока характеристик, если Ozon его
+    # показывает. Пусто, если на странице кода нет.
+    tnved: str | None = Field(None, description="Код ТН ВЭД (цифры)")
+
     # Описание и категория
     description: str | None = Field(None, description="Текстовое описание товара")
     category: str | None = Field(None, description="Категория")
@@ -87,6 +116,15 @@ class OzonCard(BaseModel):
         default_factory=list,
         description="Список вариантов (размеров) с доступностью, ценой и sku",
     )
+
+    # Все переключатели вариантов (цвет, размер и т. п.), каждый со своими sku.
+    aspects: list[OzonAspect] = Field(
+        default_factory=list,
+        description="Все переключатели вариантов из webAspects",
+    )
+
+    # Признак полного разбора: в разметке найден полный блок характеристик.
+    full_content: bool = Field(False, description="Полный блок характеристик собран")
 
     # Продавец
     seller: OzonSeller = Field(default_factory=OzonSeller)

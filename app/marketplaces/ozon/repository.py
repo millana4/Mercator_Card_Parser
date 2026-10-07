@@ -41,7 +41,7 @@ class OzonRepository:
         m = re.search(r"-(\d+)/?(?:\?|$)", url)
         return m.group(1) if m else None
 
-    def fetch_raw(self, url: str) -> dict:
+    def fetch_raw(self, url: str, full_content: bool = False) -> dict:
         """
         Открыть карточку и вернуть сырьё:
           {html, nuxt_state, screenshot_png}.
@@ -54,7 +54,7 @@ class OzonRepository:
         logger.debug("OzonRepository.fetch_raw: url=%s", url)
         parser = OzonParser(self.policy)
         try:
-            html = parser.fetch_html(url)
+            html = parser.fetch_html(url, full_content=full_content)
             not_found = ('data-widget="error"' in html
                          or "Такой страницы не существует" in html)
             nuxt = {} if not_found else extract_nuxt_state(html)
