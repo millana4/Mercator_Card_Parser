@@ -2,12 +2,15 @@
 """
 parser.py — низкоуровневый движок парсинга Ozon.
 
-Ответственность: открыть страницу в stealth-Chrome, дождаться данных, вернуть
+Ответственность: открыть страницу в Chrome с согласованным профилем Windows, дождаться данных, вернуть
 HTML и извлечённый объект __NUXT__.state. Ничего не сохраняет на диск и не
 собирает доменную карточку — это делают слои выше (repository/service/mapper).
 
 Таймауты, паузы и ретраи берутся из MarketplacePolicy (см. core/config.py),
 поэтому у Ozon своя политика, а у будущих WB/Я.Маркет — своя.
+
+Устройство (экран, ядра, память, видеокарта) — из профиля устройства
+(device_profile.py); экран — свой Xvfb на сессию браузера (display.py).
 """
 
 import re
@@ -24,11 +27,12 @@ from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as ec
 from selenium.webdriver.chrome.options import Options
 from selenium.webdriver.chrome.service import Service
-from selenium_stealth import stealth
 
 from app.core.config import MarketplacePolicy
 from app.core.logging import get_logger
-from app.core.exceptions import AntibotBlockedError, OutOfStockError
+from app.core.exceptions import AntibotBlockedError, OutOfStockError, PageLoadError
+from app.marketplaces.ozon.device_profile import DeviceProfile, pick_device
+from app.marketplaces.ozon.display import VirtualDisplay
 from app.marketplaces.ozon.nuxt import extract_nuxt_state
 
 logger = get_logger(__name__)
@@ -37,13 +41,91 @@ logger = get_logger(__name__)
 # (paginator, fetchType=scroll) — когда окно прокручено к концу загруженной части.
 FULL_CONTENT_MARKER = 'data-widget="webCharacteristics"'
 
+# --- Согласованный профиль Windows ---
+# User-Agent Chrome для Windows 10 x64; версия — мажорная установленного Chrome
+# (Chrome сам сокращает её до «NNN.0.0.0»).
+WINDOWS_UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+              "(KHTML, like Gecko) Chrome/{major}.0.0.0 Safari/537.36")
+# Список языков без весов: Chrome сам расставит q в заголовке Accept-Language.
+ACCEPT_LANGUAGE = "ru-RU,ru,en-US,en"
+
+# Подмены устройства: выполняются до скриптов каждой новой страницы.
+# Строки видеокарты WebGL, navigator.deviceMemory, screen.availHeight.
+# Подменённые функции и геттеры при toString() показывают текст оригинала,
+# как встроенные («function getParameter() { [native code] }»).
+_DEVICE_PATCH_JS = """
+(() => {
+  const CFG = __CFG__;
+  const originals = new WeakMap();
+  const nativeToString = Function.prototype.toString;
+  const toStringProxy = new Proxy(nativeToString, {
+    apply(target, self, args) {
+      return Reflect.apply(target, originals.get(self) || self, args);
+    },
+  });
+  originals.set(toStringProxy, nativeToString);
+  Function.prototype.toString = toStringProxy;
+
+  const wrap = (fn, apply) => {
+    const proxy = new Proxy(fn, {apply});
+    originals.set(proxy, fn);
+    return proxy;
+  };
+  const patchGetter = (proto, prop, value) => {
+    const d = proto && Object.getOwnPropertyDescriptor(proto, prop);
+    if (!d || !d.get) return;
+    Object.defineProperty(proto, prop, Object.assign({}, d, {get: wrap(d.get, () => value)}));
+  };
+  const patchWebGL = (proto) => {
+    if (!proto) return;
+    proto.getParameter = wrap(proto.getParameter, (target, self, args) => {
+      if (args[0] === 0x9245) return CFG.webglVendor;
+      if (args[0] === 0x9246) return CFG.webglRenderer;
+      return Reflect.apply(target, self, args);
+    });
+  };
+  patchWebGL(window.WebGLRenderingContext && WebGLRenderingContext.prototype);
+  patchWebGL(window.WebGL2RenderingContext && WebGL2RenderingContext.prototype);
+  patchGetter(window.Navigator && Navigator.prototype, 'deviceMemory', CFG.deviceMemory);
+  patchGetter(window.Screen && Screen.prototype, 'availHeight', CFG.availHeight);
+})();
+"""
+
+# Марки Client Hints — как их строит Chromium (components/embedder_support/
+# user_agent_utils.cc): символы и версия GREASE-марки и порядок трёх марок
+# выбираются по мажорной версии.
+_GREASE_CHARS = [" ", "(", ":", "-", ".", "/", ")", ";", "=", "?", "_"]
+_GREASE_VERSIONS = ["8", "99", "24"]
+_BRAND_ORDERS = [(0, 1, 2), (0, 2, 1), (1, 0, 2), (1, 2, 0), (2, 0, 1), (2, 1, 0)]
+
+
+def chrome_brands(full_version: str) -> tuple[list[dict], list[dict]]:
+    """brands и fullVersionList Client Hints Google Chrome указанной версии.
+    Флаг --user-agent обнуляет настоящие Client Hints браузера, поэтому строим
+    их сами; совпадение с настоящими проверяет utils/fp_check.py."""
+    major = int(full_version.split(".")[0])
+    grease_brand = f"Not{_GREASE_CHARS[major % 11]}A{_GREASE_CHARS[(major + 1) % 11]}Brand"
+    grease_version = _GREASE_VERSIONS[major % 3]
+    entries = [(grease_brand, grease_version, f"{grease_version}.0.0.0"),
+               ("Chromium", str(major), full_version),
+               ("Google Chrome", str(major), full_version)]
+    brands: list = [None, None, None]
+    full_list: list = [None, None, None]
+    for slot, (brand, version, full) in zip(_BRAND_ORDERS[major % 6], entries):
+        brands[slot] = {"brand": brand, "version": version}
+        full_list[slot] = {"brand": brand, "version": full}
+    return brands, full_list
+
+
 class OzonParser:
     """Драйвер + получение HTML + извлечение __NUXT__ для одной карточки Ozon."""
 
-    def __init__(self, policy: MarketplacePolicy):
+    def __init__(self, policy: MarketplacePolicy, device: DeviceProfile | None = None):
         self.policy = policy
+        self.device = device or pick_device(os.environ.get("PARSER_ID", "0"), 0)
         self.driver = None
         self.wait = None
+        self.display: VirtualDisplay | None = None
         # Постоянный профиль (том): кука-пропуск антибота переживает карточки и
         # рестарты. Если путь не задан — временный профиль.
         persistent = os.environ.get("OZON_CHROME_PROFILE_DIR")
@@ -58,6 +140,10 @@ class OzonParser:
         logger.debug("OzonParser.__init__: профиль Chrome=%s (temp=%s)",
                      self.chrome_temp_dir, self._profile_is_temp)
         try:
+            if not self.policy.headless:
+                # Свой экран с разрешением устройства на время жизни браузера.
+                self.display = VirtualDisplay(self.device.width, self.device.height)
+                self.display.start()
             self._setup_driver()
             self.wait = WebDriverWait(self.driver, policy.wait_timeout)
         except Exception:
@@ -83,40 +169,93 @@ class OzonParser:
 
     # ------------------------------------------------------------------ #
     def _setup_driver(self):
-        """Stealth-конфигурация Chrome (та, что проходит антибот Ozon)."""
-        logger.debug("_setup_driver: headless=%s", self.policy.headless)
+        """Chrome с согласованным профилем Windows (без selenium-stealth):
+        окно на своём Xvfb (OZON_HEADLESS=false), программный WebGL, шрифты
+        по умолчанию как в Chrome на Windows, User-Agent и Client Hints —
+        Windows 10 с версией установленного Chrome, устройство — из профиля."""
+        logger.debug("_setup_driver: headless=%s, устройство=%s",
+                     self.policy.headless, self.device.name)
+        major = (os.environ.get("CHROME_VERSION") or "").split(".")[0]
         opts = Options()
         if self.policy.headless:
             opts.add_argument("--headless=new")
         opts.add_argument("--no-sandbox")
         opts.add_argument("--disable-dev-shm-usage")
-        opts.add_argument("--disable-gpu")
         opts.add_argument("--disable-extensions")
         opts.add_argument("--disable-setuid-sandbox")
-        opts.add_argument("--window-size=1920,1080")
+        # Окно на всю доступную область экрана (без панели задач).
+        opts.add_argument(f"--window-size={self.device.width},{self.device.avail_height}")
+        opts.add_argument("--window-position=0,0")
+        opts.add_argument("--lang=ru-RU")
         opts.add_argument("--disable-blink-features=AutomationControlled")
-        opts.add_argument("--disable-features=UserAgentClientHint")
+        # Программный WebGL: GPU на сервере нет, без этих флагов WebGL недоступен.
+        opts.add_argument("--use-gl=angle")
+        opts.add_argument("--use-angle=swiftshader")
+        opts.add_argument("--enable-unsafe-swiftshader")
+        if major:
+            # UA для всех запросов браузера, включая воркеры; Client Hints и platform — через CDP.
+            opts.add_argument(f"--user-agent={WINDOWS_UA.format(major=major)}")
         opts.add_experimental_option("excludeSwitches", ["enable-automation"])
         opts.add_experimental_option("useAutomationExtension", False)
-        opts.add_argument(
-            "--user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-            "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/151.0.0.0 Safari/537.36"
-        )
+        opts.add_experimental_option("prefs", {
+            "intl.accept_languages": "ru-RU,ru,en-US,en",
+            "webkit.webprefs.fonts.standard.Zyyy": "Times New Roman",
+            "webkit.webprefs.fonts.serif.Zyyy": "Times New Roman",
+            "webkit.webprefs.fonts.sansserif.Zyyy": "Arial",
+            "webkit.webprefs.fonts.fixed.Zyyy": "Courier New",
+        })
         opts.add_argument(f"--user-data-dir={self.chrome_temp_dir}")
 
-        service = Service("/usr/local/bin/chromedriver")
+        env = dict(os.environ)
+        if self.display is not None:
+            env["DISPLAY"] = self.display.name
+        service = Service("/usr/local/bin/chromedriver", env=env)
         self.driver = webdriver.Chrome(service=service, options=opts)
-        stealth(
-            self.driver,
-            languages=["ru-RU", "ru", "en-US", "en"],
-            vendor="Google Inc.",
-            platform="Win32",
-            webgl_vendor="Intel Inc.",
-            renderer="Intel Iris OpenGL Engine",
-            fix_hairline=True,
-            run_on_insecure_origins=False,
-        )
-        logger.info("Драйвер Chrome инициализирован (headless=%s)", self.policy.headless)
+        self._apply_windows_profile()
+        logger.info("Драйвер Chrome инициализирован (headless=%s, устройство=%s, %sx%s)",
+                    self.policy.headless, self.device.name,
+                    self.device.width, self.device.height)
+
+    def _apply_windows_profile(self) -> None:
+        """Подмены через CDP: User-Agent, Client Hints и navigator.platform —
+        Windows 10 x64 с версией установленного Chrome; число ядер, память,
+        видеокарта WebGL и доступная высота экрана — из профиля устройства.
+        Марки Client Hints строятся по алгоритму Chromium (chrome_brands)."""
+        full_version = self.driver.capabilities.get("browserVersion", "")
+        major = full_version.split(".")[0]
+        env_major = (os.environ.get("CHROME_VERSION") or "").split(".")[0]
+        if env_major and env_major != major:
+            logger.warning("CHROME_VERSION=%s не совпадает с версией браузера %s",
+                           env_major, full_version)
+        brands, full_list = chrome_brands(full_version)
+
+        self.driver.execute_cdp_cmd("Emulation.setUserAgentOverride", {
+            "userAgent": WINDOWS_UA.format(major=major),
+            "acceptLanguage": ACCEPT_LANGUAGE,
+            "platform": "Win32",
+            "userAgentMetadata": {
+                "brands": brands,
+                "fullVersionList": full_list,
+                "fullVersion": full_version,
+                "platform": "Windows",
+                "platformVersion": "10.0.0",
+                "architecture": "x86",
+                "model": "",
+                "mobile": False,
+                "bitness": "64",
+                "wow64": False,
+            },
+        })
+        self.driver.execute_cdp_cmd("Emulation.setHardwareConcurrencyOverride",
+                                    {"hardwareConcurrency": self.device.cores})
+        cfg = {
+            "webglVendor": self.device.webgl_vendor,
+            "webglRenderer": self.device.webgl_renderer,
+            "deviceMemory": self.device.memory,
+            "availHeight": self.device.avail_height,
+        }
+        patch_js = _DEVICE_PATCH_JS.replace("__CFG__", json.dumps(cfg, ensure_ascii=False))
+        self.driver.execute_cdp_cmd("Page.addScriptToEvaluateOnNewDocument", {"source": patch_js})
 
     # ------------------------------------------------------------------ #
     def _pause(self):
@@ -344,7 +483,9 @@ class OzonParser:
     # ------------------------------------------------------------------ #
 
     def fetch_html_in_session(self, url: str, full_content: bool = False) -> str:
-        """Открыть карточку в УЖЕ живом браузере (сессия переиспользуется)."""
+        """Открыть карточку в УЖЕ живом браузере (сессия переиспользуется).
+        Капча или блок → AntibotBlockedError (бан). Браузер не ответил или нет
+        __NUXT__ без признаков капчи → PageLoadError (сбой загрузки)."""
         self.driver.set_page_load_timeout(self.policy.page_load_timeout)
         logger.info("Открываю карточку в сессии: %s", url)
         self._pause()
@@ -353,8 +494,13 @@ class OzonParser:
         except Exception as e:
             logger.warning("Ошибка загрузки страницы: %s", e)
 
+        try:
+            current_url = self.driver.current_url
+        except Exception as e:
+            logger.warning("Браузер не отвечает после перехода: %s", e)
+            raise PageLoadError("Браузер не отвечает после перехода.", marketplace="ozon")
+
         # --- Проверка на редирект на поиск ---
-        current_url = self.driver.current_url
         if "/search/" in current_url and "/product/" not in current_url:
             sku = self._sku_from_url(url)
             if sku and f"product_id={sku}" in current_url:
@@ -375,16 +521,20 @@ class OzonParser:
         self._pause()
         try:
             self.wait.until(lambda d: "__NUXT__" in d.page_source)
-            logger.info("Страница отдала __NUXT__ — данные получены")
-            if full_content:
-                self.ensure_full_content()
-            return self.driver.page_source
         except Exception:
-            logger.warning("__NUXT__ не появился — считаю блокировкой")
-            raise AntibotBlockedError(
-                "Не удалось получить страницу: антибот/блокировка.",
-                marketplace="ozon",
-            )
+            if self._is_blocked():
+                raise AntibotBlockedError(
+                    "Не удалось получить страницу: антибот/блокировка.",
+                    marketplace="ozon",
+                )
+            logger.warning("__NUXT__ не появился за %s с, признаков капчи нет — сбой загрузки",
+                           self.policy.wait_timeout)
+            raise PageLoadError("Страница не загрузилась: нет __NUXT__, признаков капчи нет.",
+                                marketplace="ozon")
+        logger.info("Страница отдала __NUXT__ — данные получены")
+        if full_content:
+            self.ensure_full_content()
+        return self.driver.page_source
 
     def screenshot_png(self) -> bytes | None:
         """Скриншот текущей страницы (для debug-артефактов). None при ошибке."""
@@ -394,15 +544,29 @@ class OzonParser:
             logger.debug("Скриншот не удался: %s", e)
             return None
 
+    def block_snapshot(self) -> dict:
+        """title, адрес и скриншот текущей страницы — для разбора блокировки.
+        Исключений не бросает: что не удалось получить, будет None."""
+        title = url = None
+        try:
+            title = self.driver.title
+            url = self.driver.current_url
+        except Exception as e:
+            logger.debug("Не удалось прочитать title/адрес при блокировке: %s", e)
+        return {"title": title, "url": url, "png": self.screenshot_png()}
+
     def close(self):
-        """Закрыть драйвер. Постоянный профиль сохраняем (кука антибота),
-        временный — удаляем."""
+        """Закрыть драйвер и свой Xvfb. Постоянный профиль сохраняем
+        (кука антибота), временный — удаляем."""
         if self.driver:
             try:
                 self.driver.quit()
             except Exception as e:
                 logger.debug("Ошибка quit(): %s", e)
             self.driver = None
+        if self.display is not None:
+            self.display.stop()
+            self.display = None
         if getattr(self, "_profile_is_temp", True) and self.chrome_temp_dir:
             shutil.rmtree(self.chrome_temp_dir, ignore_errors=True)
         logger.debug("OzonParser.close: ресурсы освобождены (temp=%s)",

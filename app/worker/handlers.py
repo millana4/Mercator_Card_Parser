@@ -1,14 +1,19 @@
 # -*- coding: utf-8 -*-
 """
-handlers.py — обработчики задач select и parse.
-Транспортный переходник: задача → вызов существующего OzonService → результат
-с эхо-полями. Логику подбора/парсинга не меняет.
+handlers.py — обработчики задач select, search и parse.
+Транспортный переходник: задача → вызов OzonService → результат с эхо-полями.
+Логику подбора/парсинга не меняет.
+
+Внутреннее поле результата "_failure" (ban | load | None) сообщает воркеру,
+была ли блокировка или сбой загрузки; воркер убирает его перед отправкой в ядро.
+Для ядра оба случая — error_code=antibot_blocked («повторить позже»).
 """
 
 from datetime import datetime, timezone
 from app.core.logging import get_logger
 from app.core.config import settings
-from app.core.exceptions import AntibotBlockedError, ProductNotFoundError, InvalidRequestError
+from app.core.exceptions import (AntibotBlockedError, InvalidRequestError,
+                                 PageLoadError, ProductNotFoundError)
 from app.marketplaces.ozon.service import OzonService
 from app.marketplaces.ozon.selection import StratumRequest, ExcludedCard
 
@@ -44,6 +49,7 @@ def handle_select(task: dict, service: OzonService) -> dict:
             **echo, "ok": False,
             "requested_count": task.get("count"), "found_count": 0,
             "cards": [], "error": _error_text(e), "error_code": _error_code(e),
+            "_failure": _failure_kind(e),
         }
 
 
@@ -71,7 +77,8 @@ def handle_parse(task: dict, service: OzonService) -> dict:
     except Exception as e:
         logger.exception("PARSE задача провалилась | task_id=%s sku=%s", echo["task_id"], sku)
         return {**echo, "ok": False, "card": None,
-                "error": _error_text(e), "error_code": _error_code(e)}
+                "error": _error_text(e), "error_code": _error_code(e),
+                "_failure": _failure_kind(e)}
 
 
 def handle_search(task: dict, service: OzonService) -> dict:
@@ -103,7 +110,8 @@ def handle_search(task: dict, service: OzonService) -> dict:
         logger.exception("SEARCH задача провалилась | task_id=%s query=%r",
                          echo["task_id"], echo["query"])
         return {**echo, **empty, "ok": False, "parsed_at": _now(),
-                "error": _error_text(e), "error_code": _error_code(e)}
+                "error": _error_text(e), "error_code": _error_code(e),
+                "_failure": _failure_kind(e)}
 
 
 def _build_stratum_request(task: dict) -> StratumRequest:
@@ -127,6 +135,8 @@ def _build_stratum_request(task: dict) -> StratumRequest:
 
 
 def _error_text(e: Exception) -> str:
+    if isinstance(e, PageLoadError):
+        return f"Сбой загрузки: {e}"
     if isinstance(e, AntibotBlockedError):
         return f"Антибот заблокировал: {e}"
     if isinstance(e, ProductNotFoundError):
@@ -135,7 +145,9 @@ def _error_text(e: Exception) -> str:
         return f"Некорректный запрос: {e}"
     return f"{type(e).__name__}: {e}"
 
+
 def _error_code(e: Exception) -> str:
+    # PageLoadError — подтип AntibotBlockedError: для ядра тот же antibot_blocked.
     if isinstance(e, AntibotBlockedError):
         return "antibot_blocked"
     if isinstance(e, ProductNotFoundError):
@@ -143,6 +155,15 @@ def _error_code(e: Exception) -> str:
     if isinstance(e, InvalidRequestError):
         return "invalid_request"
     return "internal_error"
+
+
+def _failure_kind(e: Exception) -> str | None:
+    """Внутренний признак для воркера: ban — капча/блок, load — сбой загрузки."""
+    if isinstance(e, PageLoadError):
+        return "load"
+    if isinstance(e, AntibotBlockedError):
+        return "ban"
+    return None
 
 
 def _now() -> str:

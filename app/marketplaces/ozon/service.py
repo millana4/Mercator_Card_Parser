@@ -9,24 +9,28 @@ service.py — бизнес-логика парсинга Ozon (оркестра
   4) в Kafka уходит событие о результате (если включено).
 
 Два режима получения страниц:
-  - use_session=False (воркер, как раньше): карточки и выдача для подбора —
-    новый браузер на вызов (repository); обход — долгоживущая сессия;
-  - use_session=True (HTTP API): всё через одну долгоживущую сессию браузера,
-    как у обхода в воркере: главная, переходы изнутри Ozon, браузер переживает
-    запросы. Вызовы выполняются по очереди под блокировкой.
+  - use_session=True (воркер и HTTP API): все задачи через одну долгоживущую
+    сессию браузера и один профиль: главная, переходы изнутри Ozon, браузер
+    переживает задачи. Вызовы выполняются по очереди под блокировкой;
+  - use_session=False (только диагностика): новый браузер на каждый вызов
+    через repository.
 """
 
 import os
 import json
+import random
+import shutil
 import threading
 import time
 from datetime import datetime, timezone
 
 from app.core.config import settings, MarketplacePolicy
-from app.core.exceptions import AntibotBlockedError, InvalidRequestError, ProductNotFoundError, OutOfStockError
+from app.core.exceptions import (AntibotBlockedError, InvalidRequestError, OutOfStockError,
+                                 PageLoadError, ProductNotFoundError)
 from app.core.logging import get_logger
 from app.marketplaces.ozon.mapper import build_card
 from app.marketplaces.ozon.models import OzonCard
+from app.marketplaces.ozon.device_profile import DeviceProfile, pick_device
 from app.marketplaces.ozon.nuxt import extract_nuxt_state
 from app.marketplaces.ozon.parser import OzonParser
 from app.marketplaces.ozon.repository import OzonRepository
@@ -37,6 +41,30 @@ from app.shared.logger import emit_event
 logger = get_logger(__name__)
 
 
+# Префикс снимков блокировок в debug_dir (сохраняются и без DEBUG, с ротацией).
+BLOCK_PREFIX = "block_"
+
+class NavigationPacer:
+    """Пауза между переходами внутри одной задачи (подбор: страницы выдачи и
+    карточки-кандидаты). Перед первым переходом не ждём — паузу после прошлой
+    задачи уже выдержал воркер; перед каждым следующим — случайная пауза
+    из [lo, hi]."""
+
+    def __init__(self, lo: float, hi: float, sleep=None):
+        self.lo = lo
+        self.hi = hi
+        self._sleep = sleep or time.sleep
+        self._first = True
+
+    def wait(self) -> None:
+        if self._first:
+            self._first = False
+            return
+        delay = random.uniform(self.lo, self.hi)
+        logger.info("Пауза перед переходом подбора: %.0f с", delay)
+        self._sleep(delay)
+
+
 class OzonService:
     def __init__(self, policy: MarketplacePolicy | None = None, use_session: bool = False):
         self.policy = policy or settings.ozon_policy()
@@ -44,6 +72,8 @@ class OzonService:
         self.use_session = use_session
         self._crawl_parser = None       # долгоживущий парсер для сессии
         self._lock = threading.RLock()  # один браузер - вызовы по очереди
+        self._sleep = time.sleep        # пауза между переходами подбора
+        self._device_generation = 0     # поколение устройства браузера (растёт при каждом бане)
 
     # ------------------------------------------------------------------ #
     def _basename(self, url: str) -> str:
@@ -97,8 +127,8 @@ class OzonService:
         parser = self._crawl_parser
         try:
             html = parser.fetch_html_in_session(url, full_content=full_content)
-        except AntibotBlockedError:
-            self._close_crawl_session()
+        except AntibotBlockedError as exc:
+            self._close_after_block(parser, exc, url)
             raise
         finally:
             parser.consume_session_step()
@@ -115,8 +145,8 @@ class OzonService:
         parser = self._crawl_parser
         try:
             html = parser.fetch_listing_scrolled(page_url, scroll_steps)
-        except AntibotBlockedError:
-            self._close_crawl_session()
+        except AntibotBlockedError as exc:
+            self._close_after_block(parser, exc, page_url)
             raise
         finally:
             parser.consume_session_step()
@@ -195,6 +225,16 @@ class OzonService:
         return self.get_raw(OzonRepository.url_from_sku(sku))
 
     # ================= Обход с долгоживущей сессией (воркер) ================= #
+    def set_device_generation(self, generation: int) -> None:
+        """Поколение устройства браузера: берётся из состояния бана в Redis.
+        Новое устройство применяется со следующей сессии браузера."""
+        self._device_generation = max(int(generation), 0)
+
+    def _device(self) -> DeviceProfile:
+        """Устройство браузера для текущего парсера и поколения."""
+        return pick_device(os.environ.get("PARSER_ID", "0"), self._device_generation)
+
+
     def _ensure_crawl_session(self) -> None:
         """Гарантировать живой парсер с активной сессией. Создаёт браузер и
         начинает сессию, если его нет или сессия исчерпана."""
@@ -203,7 +243,7 @@ class OzonService:
         # Старую сессию (исчерпанную) закрываем.
         self._close_crawl_session()
         logger.info("Создаю новую сессию обхода")
-        self._crawl_parser = OzonParser(self.policy)
+        self._crawl_parser = OzonParser(self.policy, device=self._device())
         self._crawl_parser.begin_session()
 
     def _close_crawl_session(self) -> None:
@@ -214,6 +254,69 @@ class OzonService:
             except Exception as e:
                 logger.debug("Ошибка закрытия сессии обхода: %s", e)
             self._crawl_parser = None
+
+    def _close_after_block(self, parser, exc: AntibotBlockedError, url: str) -> None:
+        """Блокировка или сбой загрузки: сохранить title, адрес и скриншот,
+        закрыть браузер — следующая задача начнёт новую сессию."""
+        self._save_block_artifacts(parser, exc, url)
+        self._close_crawl_session()
+
+    def _save_block_artifacts(self, parser, exc: AntibotBlockedError, url: str) -> None:
+        """Снимок блокировки в debug_dir: json (вид, причина, title, адреса) + png.
+        Сохраняется и без DEBUG; хранятся последние policy.block_artifacts_keep."""
+        try:
+            snap = parser.block_snapshot()
+            os.makedirs(settings.debug_dir, exist_ok=True)
+            base = f"{BLOCK_PREFIX}{datetime.now():%Y%m%d_%H%M%S_%f}"
+            info = {
+                "at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+                "kind": "load" if isinstance(exc, PageLoadError) else "ban",
+                "reason": str(exc),
+                "requested_url": url,
+                "title": snap.get("title"),
+                "current_url": snap.get("url"),
+            }
+            with open(os.path.join(settings.debug_dir, f"{base}.json"), "w", encoding="utf-8") as f:
+                json.dump(info, f, ensure_ascii=False, indent=2)
+            if snap.get("png"):
+                with open(os.path.join(settings.debug_dir, f"{base}.png"), "wb") as f:
+                    f.write(snap["png"])
+            logger.warning("Снимок блокировки сохранён: %s (вид=%s, title=%r, url=%r)",
+                           base, info["kind"], info["title"], info["current_url"])
+            self._rotate_block_artifacts()
+        except Exception as e:
+            logger.warning("Не удалось сохранить снимок блокировки: %s", e)
+
+    def _rotate_block_artifacts(self) -> None:
+        """Оставить в debug_dir только последние block_artifacts_keep снимков."""
+        keep = self.policy.block_artifacts_keep
+        names = [n for n in os.listdir(settings.debug_dir) if n.startswith(BLOCK_PREFIX)]
+        bases = sorted({n.rsplit(".", 1)[0] for n in names})
+        old = bases[:-keep] if keep > 0 else bases
+        for base in old:
+            for ext in (".json", ".png"):
+                path = os.path.join(settings.debug_dir, base + ext)
+                if os.path.exists(path):
+                    os.remove(path)
+
+    def reset_profile(self) -> None:
+        """Бан: закрыть браузер и удалить содержимое постоянного профиля —
+        следующая сессия начнётся с чистой личностью гостя."""
+        with self._lock:
+            self._close_crawl_session()
+            profile_dir = os.environ.get("OZON_CHROME_PROFILE_DIR")
+            if not profile_dir or not os.path.isdir(profile_dir):
+                return
+            for name in os.listdir(profile_dir):
+                path = os.path.join(profile_dir, name)
+                try:
+                    if os.path.isdir(path) and not os.path.islink(path):
+                        shutil.rmtree(path)
+                    else:
+                        os.remove(path)
+                except Exception as e:
+                    logger.warning("Не удалось удалить %s из профиля: %s", path, e)
+            logger.warning("Профиль браузера сброшен: %s", profile_dir)
 
     def get_card_for_crawl(self, url: str, full_content: bool = False) -> dict:
         """Разобрать карточку в рамках долгоживущей сессии (путь ОБХОДА).
@@ -241,7 +344,7 @@ class OzonService:
             return {"card": card.model_dump(), "debug_files": None}
         except AntibotBlockedError as exc:
             self._emit_blocked(url, exc)
-            self._close_crawl_session()  # бан прерывает всю сессию
+            self._close_after_block(parser, exc, url)  # бан или сбой загрузки прерывает сессию
             raise
         finally:
             # Переход израсходован в любом случае (даже при 404).
@@ -404,8 +507,8 @@ class OzonService:
             raw_tiles, scrolls = parser.scroll_collect_tiles(target, self.policy.search_max_scrolls)
             html = parser.driver.page_source
             png = parser.screenshot_png()
-        except AntibotBlockedError:
-            self._close_crawl_session()
+        except AntibotBlockedError as exc:
+            self._close_after_block(parser, exc, page_url)
             raise
         finally:
             parser.consume_session_step()
@@ -460,11 +563,17 @@ class OzonService:
                     strategy.name, req.query, req.count, req.is_seasonal,
                     req.base_share, len(req.exclude), min_rating, min_reviews)
 
+        # Пауза между переходами внутри задачи — та же, что между карточками обхода.
+        pacer = NavigationPacer(self.policy.between_cards_min,
+                                self.policy.between_cards_max, sleep=self._sleep)
+
         def fetch_page(url):
             # первая страница — по query (url=None), следующие — по nextPage
+            pacer.wait()
             return self._fetch_listing(query=req.query if url is None else None, url=url)
 
         def get_card_only(card_url):
+            pacer.wait()
             res = self.get_card(card_url)
             return OzonCard(**res["card"])
 

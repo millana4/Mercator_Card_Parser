@@ -59,8 +59,11 @@ class MarketplacePolicy:
     between_cards_max: float            # сек: макс. пауза между карточками (primary)
     reserve_between_cards_min: float    # сек: мин. пауза между карточками для запасного парсера (reserve, щадящий темп)
     reserve_between_cards_max: float    # сек: макс. пауза между карточками (reserve)
-    antibot_streak_threshold: int       # сколько блокировок подряд считать «полосой» → уйти в cooldown
-    antibot_cooldown_s: int             # сек: сколько воркер спит при полосе блокировок (даёт IP остыть)
+    load_failure_threshold: int         # сколько сбоев загрузки подряд считать баном
+    ban_pause_start_s: float            # сек: первая пауза после бана; каждая следующая ×2
+    ban_pause_max_s: float              # сек: потолок паузы после бана
+    ban_level_reset_s: float            # сек: столько без бана после конца паузы — уровень обнуляется
+    block_artifacts_keep: int           # сколько последних блокировок хранить (json + png) в debug_dir
     session_min: int                    # мин. число карточек в одной сессии браузера до пересоздания
     session_max: int                    # макс. число карточек в сессии браузера
     min_rating: float                   # порог отбора: мин. рейтинг карточки-кандидата при подборе
@@ -94,12 +97,15 @@ class Settings:
             retries=_get_int("OZON_RETRIES", 2),
             retry_pause_min=_get_float("OZON_RETRY_PAUSE_MIN", 60.0),
             retry_pause_max=_get_float("OZON_RETRY_PAUSE_MAX", 80.0),
-            between_cards_min=_get_float("OZON_BETWEEN_CARDS_MIN", 60.0),
-            between_cards_max=_get_float("OZON_BETWEEN_CARDS_MAX", 80.0),
+            between_cards_min=_get_float("OZON_BETWEEN_CARDS_MIN", 50.0),
+            between_cards_max=_get_float("OZON_BETWEEN_CARDS_MAX", 90.0),
             reserve_between_cards_min=_get_float("OZON_RESERVE_BETWEEN_CARDS_MIN", 50.0),
             reserve_between_cards_max=_get_float("OZON_RESERVE_BETWEEN_CARDS_MAX", 80.0),
-            antibot_streak_threshold=_get_int("OZON_ANTIBOT_STREAK_THRESHOLD", 3),
-            antibot_cooldown_s=_get_int("OZON_ANTIBOT_COOLDOWN_S", 600),
+            load_failure_threshold=_get_int("OZON_LOAD_FAILURE_THRESHOLD", 3),
+            ban_pause_start_s=_get_float("OZON_BAN_PAUSE_START_S", 600.0),
+            ban_pause_max_s=_get_float("OZON_BAN_PAUSE_MAX_S", 86400.0),
+            ban_level_reset_s=_get_float("OZON_BAN_LEVEL_RESET_S", 86400.0),
+            block_artifacts_keep=_get_int("OZON_BLOCK_ARTIFACTS_KEEP", 50),
             session_min=_get_int("OZON_SESSION_MIN", 20),
             session_max=_get_int("OZON_SESSION_MAX", 50),
             min_rating=_get_float("OZON_MIN_RATING", 4.8),

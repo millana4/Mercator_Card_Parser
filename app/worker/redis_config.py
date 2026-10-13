@@ -118,5 +118,12 @@ class RedisWorkerSettings(BaseSettings):
     def counter_search_antibot(self, marketplace: str) -> str:
         return f"parser:{self.parser_id}:{marketplace}:search_antibot"
 
+    def counter_load_failed(self, marketplace: str) -> str:
+        return f"parser:{self.parser_id}:{marketplace}:load_failed"
+
+    # --- Состояние бана (уровень, конец паузы): переживает перезапуск воркера ---
+    def ban_state_key(self, marketplace: str) -> str:
+        return f"parser:{self.parser_id}:{marketplace}:ban"
+
 
 redis_worker_settings = RedisWorkerSettings()

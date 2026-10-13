@@ -5,6 +5,8 @@ exceptions.py — доменные исключения сервиса и их �
 Зачем отдельные типы: вызывающим сервисам (таск-менеджеру) важно различать
 ситуации, чтобы решать, что делать дальше:
   - AntibotBlockedError   — заблокировал антибот → имеет смысл повторить позже;
+  - PageLoadError         — страница не загрузилась, признаков капчи нет (подтип
+                            AntibotBlockedError: для ядра тот же код antibot_blocked);
   - ProductNotFoundError  — товара/данных нет → пропустить;
   - InvalidRequestError   — кривой URL/SKU → отклонить, не повторять;
   - OutOfStockError       — товар закончился: Ozon увёл на поиск, сохранив product_id запрошенного sku
@@ -32,6 +34,13 @@ class AntibotBlockedError(ParsingError):
     """Антибот отдал капчу/блок. Имеет смысл повторить позже."""
     http_status = 503
     code = "antibot_blocked"
+
+
+class PageLoadError(AntibotBlockedError):
+    """Страница не загрузилась: браузер не ответил или нет __NUXT__ при отсутствии
+    признаков капчи. Для ядра — то же «повторить позже» (код antibot_blocked,
+    обработка в ядре не меняется). Воркер считает это сбоем загрузки, а не баном:
+    пересоздаёт браузер; баном считается только серия сбоев подряд."""
 
 
 class ProductNotFoundError(ParsingError):
