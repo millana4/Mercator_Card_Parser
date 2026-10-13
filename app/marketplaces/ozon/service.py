@@ -28,6 +28,7 @@ from app.core.config import settings, MarketplacePolicy
 from app.core.exceptions import (AntibotBlockedError, InvalidRequestError, OutOfStockError,
                                  PageLoadError, ProductNotFoundError)
 from app.core.logging import get_logger
+from selenium.common.exceptions import WebDriverException
 from app.marketplaces.ozon.mapper import build_card
 from app.marketplaces.ozon.models import OzonCard
 from app.marketplaces.ozon.device_profile import DeviceProfile, pick_device
@@ -130,6 +131,8 @@ class OzonService:
         except AntibotBlockedError as exc:
             self._close_after_block(parser, exc, url)
             raise
+        except WebDriverException as e:
+            raise self._browser_failure(parser, e, url) from e
         finally:
             parser.consume_session_step()
         not_found = ('data-widget="error"' in html
@@ -148,6 +151,8 @@ class OzonService:
         except AntibotBlockedError as exc:
             self._close_after_block(parser, exc, page_url)
             raise
+        except WebDriverException as e:
+            raise self._browser_failure(parser, e, page_url) from e
         finally:
             parser.consume_session_step()
         nuxt = {}
@@ -261,6 +266,14 @@ class OzonService:
         self._save_block_artifacts(parser, exc, url)
         self._close_crawl_session()
 
+    def _browser_failure(self, parser, e: WebDriverException, url: str) -> PageLoadError:
+        """Ошибка браузера (таймаут рендерера, браузер не отвечает) — сбой загрузки:
+        снимок, закрытие сессии. Воркер считает сбои подряд и при серии уходит в паузу."""
+        first_line = (getattr(e, "msg", None) or type(e).__name__).splitlines()[0][:200]
+        failure = PageLoadError(f"Браузер не отвечает: {first_line}", marketplace="ozon")
+        self._close_after_block(parser, failure, url)
+        return failure
+
     def _save_block_artifacts(self, parser, exc: AntibotBlockedError, url: str) -> None:
         """Снимок блокировки в debug_dir: json (вид, причина, title, адреса) + png.
         Сохраняется и без DEBUG; хранятся последние policy.block_artifacts_keep."""
@@ -346,6 +359,10 @@ class OzonService:
             self._emit_blocked(url, exc)
             self._close_after_block(parser, exc, url)  # бан или сбой загрузки прерывает сессию
             raise
+        except WebDriverException as e:
+            failure = self._browser_failure(parser, e, url)
+            self._emit_blocked(url, failure)
+            raise failure from e
         finally:
             # Переход израсходован в любом случае (даже при 404).
             if parser is not None:
@@ -380,7 +397,8 @@ class OzonService:
         просто пишется в лог уровня WARNING и дальше не идёт — мягкая деградация).
         """
         sku = OzonRepository.sku_from_url(url)
-        logger.warning("Антибот заблокировал парсинг: url=%s sku=%s", url, sku)
+        what = "Сбой загрузки" if isinstance(exc, PageLoadError) else "Антибот заблокировал парсинг"
+        logger.warning("%s: url=%s sku=%s", what, url, sku)
         emit_event("ozon.blocked",
                    {"url": url, "sku": sku, "reason": str(exc)})
 
@@ -510,6 +528,8 @@ class OzonService:
         except AntibotBlockedError as exc:
             self._close_after_block(parser, exc, page_url)
             raise
+        except WebDriverException as e:
+            raise self._browser_failure(parser, e, page_url) from e
         finally:
             parser.consume_session_step()
         return {"raw_tiles": raw_tiles, "scrolls": scrolls, "html": html,
