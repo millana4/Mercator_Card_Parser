@@ -19,3 +19,4 @@ venv/
 *.log
 .pytest_cache/
 app/chrome-profile/
+app/chrome-profile-search/

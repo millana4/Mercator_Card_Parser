@@ -153,12 +153,13 @@ def test_get_card_requests_full_content(no_debug):
 
 
 def test_get_card_in_session_requests_full_content(no_debug, monkeypatch):
-    # В режиме сессии __NUXT__ разбирает функция модуля service — подменяем её
+    # В режиме сессии __NUXT__ разбирает функция модуля service — подменяем её.
+    # get_card (подбор, HTTP) идёт в сессии выдачи.
     monkeypatch.setattr(service_module, "extract_nuxt_state", lambda html: {})
     service = OzonService(use_session=True)
-    service._crawl_parser = FakeSessionParser()
+    service._search_parser = FakeSessionParser()
     service.get_card(URL)
-    assert service._crawl_parser.calls == [True]
+    assert service._search_parser.calls == [True]
 
 
 def test_get_raw_without_full_content(no_debug):

@@ -9,11 +9,19 @@ service.py — бизнес-логика парсинга Ozon (оркестра
   4) в Kafka уходит событие о результате (если включено).
 
 Два режима получения страниц:
-  - use_session=True (воркер и HTTP API): все задачи через одну долгоживущую
-    сессию браузера и один профиль: главная, переходы изнутри Ozon, браузер
-    переживает задачи. Вызовы выполняются по очереди под блокировкой;
+  - use_session=True (воркер и HTTP API): две долгоживущие сессии браузера,
+    у каждой свой профиль и свой экран Xvfb:
+      * сессия обхода  — главная и карточки обхода (get_card_for_crawl);
+      * сессия выдачи  — главная, страницы поиска (снимки выдачи, подбор,
+        диагностика) и карточки, открытые из выдачи (подбор, HTTP get_card).
+    Сессия обхода никогда не открывает страницу поиска: вердикт антибота,
+    полученный на выдаче, остаётся в сессии выдачи.
+    Вызовы выполняются по очереди под общей блокировкой;
   - use_session=False (только диагностика): новый браузер на каждый вызов
     через repository.
+
+Постоянные профили: OZON_CHROME_PROFILE_DIR — сессия обхода,
+OZON_SEARCH_PROFILE_DIR — сессия выдачи. Не задан — временный профиль.
 """
 
 import os
@@ -45,6 +53,14 @@ logger = get_logger(__name__)
 # Префикс снимков блокировок в debug_dir (сохраняются и без DEBUG, с ротацией).
 BLOCK_PREFIX = "block_"
 
+# Сессии браузера: crawl — обход карточек, search — выдача и подбор.
+CRAWL = "crawl"
+SEARCH = "search"
+SESSIONS = (CRAWL, SEARCH)
+_SESSION_ATTR = {CRAWL: "_crawl_parser", SEARCH: "_search_parser"}
+_SESSION_PROFILE_ENV = {CRAWL: "OZON_CHROME_PROFILE_DIR", SEARCH: "OZON_SEARCH_PROFILE_DIR"}
+_SESSION_TITLE = {CRAWL: "обхода", SEARCH: "выдачи"}
+
 class NavigationPacer:
     """Пауза между переходами внутри одной задачи (подбор: страницы выдачи и
     карточки-кандидаты). Перед первым переходом не ждём — паузу после прошлой
@@ -71,10 +87,12 @@ class OzonService:
         self.policy = policy or settings.ozon_policy()
         self.repo = OzonRepository(self.policy)
         self.use_session = use_session
-        self._crawl_parser = None       # долгоживущий парсер для сессии
-        self._lock = threading.RLock()  # один браузер - вызовы по очереди
+        self._crawl_parser = None       # долгоживущий парсер сессии обхода
+        self._search_parser = None      # долгоживущий парсер сессии выдачи
+        self._lock = threading.RLock()  # браузеры - вызовы по очереди
         self._sleep = time.sleep        # пауза между переходами подбора
-        self._device_generation = 0     # поколение устройства браузера (растёт при каждом бане)
+        # Поколение устройства браузера по сессиям (растёт при бане своей сессии)
+        self._device_generation = {CRAWL: 0, SEARCH: 0}
 
     # ------------------------------------------------------------------ #
     def _basename(self, url: str) -> str:
@@ -117,22 +135,22 @@ class OzonService:
     # ================= Источник страниц: новый браузер или сессия ================= #
     def _fetch_raw(self, url: str, full_content: bool = False) -> dict:
         """Сырьё карточки/страницы {html, nuxt_state, screenshot_png, url, not_found}.
-        В режиме сессии - через долгоживущий браузер; при антиботе сессия закрывается.
+        В режиме сессии - через долгоживущий браузер сессии выдачи (подбор, HTTP):
+        карточки здесь открываются из выдачи. При антиботе сессия закрывается.
         OutOfStockError и AntibotBlockedError пробрасываются."""
         if not self.use_session:
             return self.repo.fetch_raw(url, full_content=full_content)
         url = (url or "").strip()
         if not url:
             raise InvalidRequestError("Пустой URL", marketplace="ozon")
-        self._ensure_crawl_session()
-        parser = self._crawl_parser
+        parser = self._ensure_session(SEARCH)
         try:
             html = parser.fetch_html_in_session(url, full_content=full_content)
         except AntibotBlockedError as exc:
-            self._close_after_block(parser, exc, url)
+            self._close_after_block(SEARCH, parser, exc, url)
             raise
         except WebDriverException as e:
-            raise self._browser_failure(parser, e, url) from e
+            raise self._browser_failure(SEARCH, parser, e, url) from e
         finally:
             parser.consume_session_step()
         not_found = ('data-widget="error"' in html
@@ -142,17 +160,16 @@ class OzonService:
                 "url": url, "not_found": not_found}
 
     def _listing_in_session(self, page_url: str, scroll_steps: int) -> dict:
-        """Одна страница выдачи в долгоживущей сессии (с прокруткой или без):
+        """Одна страница выдачи в сессии выдачи (с прокруткой или без):
         {html, url, next_page, current_page, total_pages, screenshot_png}."""
-        self._ensure_crawl_session()
-        parser = self._crawl_parser
+        parser = self._ensure_session(SEARCH)
         try:
             html = parser.fetch_listing_scrolled(page_url, scroll_steps)
         except AntibotBlockedError as exc:
-            self._close_after_block(parser, exc, page_url)
+            self._close_after_block(SEARCH, parser, exc, page_url)
             raise
         except WebDriverException as e:
-            raise self._browser_failure(parser, e, page_url) from e
+            raise self._browser_failure(SEARCH, parser, e, page_url) from e
         finally:
             parser.consume_session_step()
         nuxt = {}
@@ -229,53 +246,64 @@ class OzonService:
     def get_raw_by_id(self, sku: str) -> dict:
         return self.get_raw(OzonRepository.url_from_sku(sku))
 
-    # ================= Обход с долгоживущей сессией (воркер) ================= #
-    def set_device_generation(self, generation: int) -> None:
+    # ================= Долгоживущие сессии браузера (воркер и HTTP) ================= #
+    def set_device_generation(self, generation: int, session: str | None = None) -> None:
         """Поколение устройства браузера: берётся из состояния бана в Redis.
-        Новое устройство применяется со следующей сессии браузера."""
-        self._device_generation = max(int(generation), 0)
+        session — для одной сессии (бан этой сессии), None — для всех (старт воркера).
+        Новое устройство применяется со следующего браузера этой сессии."""
+        for name in ([session] if session else SESSIONS):
+            self._device_generation[name] = max(int(generation), 0)
 
-    def _device(self) -> DeviceProfile:
-        """Устройство браузера для текущего парсера и поколения."""
-        return pick_device(os.environ.get("PARSER_ID", "0"), self._device_generation)
+    def _device(self, session: str = CRAWL) -> DeviceProfile:
+        """Устройство браузера для текущего парсера и поколения сессии."""
+        return pick_device(os.environ.get("PARSER_ID", "0"), self._device_generation[session])
 
+    def _session_parser(self, session: str):
+        return getattr(self, _SESSION_ATTR[session])
 
-    def _ensure_crawl_session(self) -> None:
-        """Гарантировать живой парсер с активной сессией. Создаёт браузер и
-        начинает сессию, если его нет или сессия исчерпана."""
-        if self._crawl_parser is not None and not self._crawl_parser.session_exhausted():
-            return
-        # Старую сессию (исчерпанную) закрываем.
-        self._close_crawl_session()
-        logger.info("Создаю новую сессию обхода")
-        self._crawl_parser = OzonParser(self.policy, device=self._device())
-        self._crawl_parser.begin_session()
+    def _ensure_session(self, session: str):
+        """Живой парсер сессии с неисчерпанным лимитом переходов. Создаёт браузер
+        (своё устройство, свой профиль) и начинает сессию, если его нет или
+        лимит переходов исчерпан. Возвращает парсер."""
+        parser = self._session_parser(session)
+        if parser is not None and not parser.session_exhausted():
+            return parser
+        self._close_session(session)
+        logger.info("Создаю новую сессию %s", _SESSION_TITLE[session])
+        # Пустая строка — временный профиль (переменная не задана).
+        profile_dir = os.environ.get(_SESSION_PROFILE_ENV[session]) or ""
+        parser = OzonParser(self.policy, device=self._device(session), profile_dir=profile_dir)
+        setattr(self, _SESSION_ATTR[session], parser)
+        parser.begin_session()
+        return parser
 
-    def _close_crawl_session(self) -> None:
-        """Закрыть текущий парсер обхода (при исчерпании сессии или бане)."""
-        if self._crawl_parser is not None:
+    def _close_session(self, session: str) -> None:
+        """Закрыть браузер сессии (при исчерпании лимита, бане или остановке)."""
+        parser = self._session_parser(session)
+        if parser is not None:
             try:
-                self._crawl_parser.close()
+                parser.close()
             except Exception as e:
-                logger.debug("Ошибка закрытия сессии обхода: %s", e)
-            self._crawl_parser = None
+                logger.debug("Ошибка закрытия сессии %s: %s", _SESSION_TITLE[session], e)
+            setattr(self, _SESSION_ATTR[session], None)
 
-    def _close_after_block(self, parser, exc: AntibotBlockedError, url: str) -> None:
+    def _close_after_block(self, session: str, parser, exc: AntibotBlockedError, url: str) -> None:
         """Блокировка или сбой загрузки: сохранить title, адрес и скриншот,
-        закрыть браузер — следующая задача начнёт новую сессию."""
-        self._save_block_artifacts(parser, exc, url)
-        self._close_crawl_session()
+        закрыть браузер сессии — следующая задача этой сессии начнёт новую."""
+        self._save_block_artifacts(parser, exc, url, session=session)
+        self._close_session(session)
 
-    def _browser_failure(self, parser, e: WebDriverException, url: str) -> PageLoadError:
+    def _browser_failure(self, session: str, parser, e: WebDriverException, url: str) -> PageLoadError:
         """Ошибка браузера (таймаут рендерера, браузер не отвечает) — сбой загрузки:
         снимок, закрытие сессии. Воркер считает сбои подряд и при серии уходит в паузу."""
         first_line = (getattr(e, "msg", None) or type(e).__name__).splitlines()[0][:200]
         failure = PageLoadError(f"Браузер не отвечает: {first_line}", marketplace="ozon")
-        self._close_after_block(parser, failure, url)
+        self._close_after_block(session, parser, failure, url)
         return failure
 
-    def _save_block_artifacts(self, parser, exc: AntibotBlockedError, url: str) -> None:
-        """Снимок блокировки в debug_dir: json (вид, причина, title, адреса) + png.
+    def _save_block_artifacts(self, parser, exc: AntibotBlockedError, url: str,
+                              session: str | None = None) -> None:
+        """Снимок блокировки в debug_dir: json (вид, сессия, причина, title, адреса) + png.
         Сохраняется и без DEBUG; хранятся последние policy.block_artifacts_keep."""
         try:
             snap = parser.block_snapshot()
@@ -284,6 +312,7 @@ class OzonService:
             info = {
                 "at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
                 "kind": "load" if isinstance(exc, PageLoadError) else "ban",
+                "session": session,
                 "reason": str(exc),
                 "requested_url": url,
                 "title": snap.get("title"),
@@ -294,8 +323,8 @@ class OzonService:
             if snap.get("png"):
                 with open(os.path.join(settings.debug_dir, f"{base}.png"), "wb") as f:
                     f.write(snap["png"])
-            logger.warning("Снимок блокировки сохранён: %s (вид=%s, title=%r, url=%r)",
-                           base, info["kind"], info["title"], info["current_url"])
+            logger.warning("Снимок блокировки сохранён: %s (вид=%s, сессия=%s, title=%r, url=%r)",
+                           base, info["kind"], session, info["title"], info["current_url"])
             self._rotate_block_artifacts()
         except Exception as e:
             logger.warning("Не удалось сохранить снимок блокировки: %s", e)
@@ -312,24 +341,27 @@ class OzonService:
                 if os.path.exists(path):
                     os.remove(path)
 
-    def reset_profile(self) -> None:
-        """Бан: закрыть браузер и удалить содержимое постоянного профиля —
-        следующая сессия начнётся с чистой личностью гостя."""
+    def reset_profile(self, session: str | None = None) -> None:
+        """Бан: закрыть браузер сессии и удалить содержимое её постоянного
+        профиля — следующая сессия начнётся с чистой личностью гостя.
+        session=None — все сессии."""
         with self._lock:
-            self._close_crawl_session()
-            profile_dir = os.environ.get("OZON_CHROME_PROFILE_DIR")
-            if not profile_dir or not os.path.isdir(profile_dir):
-                return
-            for name in os.listdir(profile_dir):
-                path = os.path.join(profile_dir, name)
-                try:
-                    if os.path.isdir(path) and not os.path.islink(path):
-                        shutil.rmtree(path)
-                    else:
-                        os.remove(path)
-                except Exception as e:
-                    logger.warning("Не удалось удалить %s из профиля: %s", path, e)
-            logger.warning("Профиль браузера сброшен: %s", profile_dir)
+            for name in ([session] if session else SESSIONS):
+                self._close_session(name)
+                profile_dir = os.environ.get(_SESSION_PROFILE_ENV[name])
+                if not profile_dir or not os.path.isdir(profile_dir):
+                    continue
+                for entry in os.listdir(profile_dir):
+                    path = os.path.join(profile_dir, entry)
+                    try:
+                        if os.path.isdir(path) and not os.path.islink(path):
+                            shutil.rmtree(path)
+                        else:
+                            os.remove(path)
+                    except Exception as e:
+                        logger.warning("Не удалось удалить %s из профиля: %s", path, e)
+                logger.warning("Профиль браузера сессии %s сброшен: %s",
+                               _SESSION_TITLE[name], profile_dir)
 
     def get_card_for_crawl(self, url: str, full_content: bool = False) -> dict:
         """Разобрать карточку в рамках долгоживущей сессии (путь ОБХОДА).
@@ -338,8 +370,7 @@ class OzonService:
         воркер уйдёт в cooldown. HTTP-путь (get_card) не затрагивается."""
         t0 = time.monotonic()
         logger.info("get_card_for_crawl: старт, url=%s", url)
-        self._ensure_crawl_session()
-        parser = self._crawl_parser
+        parser = self._ensure_session(CRAWL)
         try:
             html = parser.fetch_html_in_session(url, full_content=full_content)
         except OutOfStockError:
@@ -357,10 +388,10 @@ class OzonService:
             return {"card": card.model_dump(), "debug_files": None}
         except AntibotBlockedError as exc:
             self._emit_blocked(url, exc)
-            self._close_after_block(parser, exc, url)  # бан или сбой загрузки прерывает сессию
+            self._close_after_block(CRAWL, parser, exc, url)  # бан или сбой загрузки прерывает сессию
             raise
         except WebDriverException as e:
-            failure = self._browser_failure(parser, e, url)
+            failure = self._browser_failure(CRAWL, parser, e, url)
             self._emit_blocked(url, failure)
             raise failure from e
         finally:
@@ -384,9 +415,10 @@ class OzonService:
         return self.get_card_for_crawl(OzonRepository.url_from_sku(sku), full_content=full_content)
 
     def close_crawl(self) -> None:
-        """Публичное закрытие сессии (остановка воркера или API)."""
+        """Публичное закрытие всех сессий браузера (остановка воркера или API)."""
         with self._lock:
-            self._close_crawl_session()
+            for name in SESSIONS:
+                self._close_session(name)
 
     # ------------------------------------------------------------------ #
     def _emit_blocked(self, url: str, exc: AntibotBlockedError) -> None:
@@ -516,20 +548,19 @@ class OzonService:
                 "candidates": [c.model_dump() for c in pf], "debug_files": files or None}
 
     def _tiles_in_session(self, page_url: str, target: int) -> dict:
-        """Выдача в долгоживущей сессии: переход, прокрутка до target плиток,
+        """Выдача в сессии выдачи: переход, прокрутка до target плиток,
         сбор отрисованных плиток. {raw_tiles, scrolls, html, url, screenshot_png}."""
-        self._ensure_crawl_session()
-        parser = self._crawl_parser
+        parser = self._ensure_session(SEARCH)
         try:
             parser.fetch_listing_scrolled(page_url, 0)
             raw_tiles, scrolls = parser.scroll_collect_tiles(target, self.policy.search_max_scrolls)
             html = parser.driver.page_source
             png = parser.screenshot_png()
         except AntibotBlockedError as exc:
-            self._close_after_block(parser, exc, page_url)
+            self._close_after_block(SEARCH, parser, exc, page_url)
             raise
         except WebDriverException as e:
-            raise self._browser_failure(parser, e, page_url) from e
+            raise self._browser_failure(SEARCH, parser, e, page_url) from e
         finally:
             parser.consume_session_step()
         return {"raw_tiles": raw_tiles, "scrolls": scrolls, "html": html,

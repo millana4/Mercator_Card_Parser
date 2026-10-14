@@ -8,8 +8,8 @@ services:
       - .env
     environment:
       - TZ=Europe/Moscow
-      # OZON_CHROME_PROFILE_DIR не задан: у HTTP-сервиса временный профиль на сессию
-      # браузера (после капчи - чистый). Постоянный ./app/chrome-profile - только у воркера.
+      # Профили не заданы: у HTTP-сервиса обе сессии (обход и выдача) на временных
+      # профилях (после капчи - чистые). Постоянные профили - только у воркера.
     volumes:
       - ./app/debug:/app/app/debug
     extra_hosts:
@@ -24,10 +24,13 @@ services:
       - .env
     environment:
       - TZ=Europe/Moscow
+      # Постоянные профили: сессия обхода (карточки) и сессия выдачи (поиск, подбор).
       - OZON_CHROME_PROFILE_DIR=/app/chrome-profile
+      - OZON_SEARCH_PROFILE_DIR=/app/chrome-profile-search
     volumes:
       - ./app/debug:/app/app/debug
       - ./app/chrome-profile:/app/chrome-profile
+      - ./app/chrome-profile-search:/app/chrome-profile-search
     extra_hosts:
       - "host.docker.internal:host-gateway"
     restart: unless-stopped

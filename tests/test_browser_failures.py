@@ -1,5 +1,8 @@
 # -*- coding: utf-8 -*-
-"""Ошибка браузера в пути сессии — сбой загрузки: снимок, закрытие сессии."""
+"""Ошибка браузера в пути сессии — сбой загрузки: снимок, закрытие сессии.
+Закрывается только сессия, где случился сбой; другая не трогается."""
+import json
+
 import pytest
 from selenium.common.exceptions import TimeoutException
 
@@ -40,22 +43,31 @@ def service(monkeypatch, tmp_path):
     monkeypatch.setattr(settings, "debug_dir", str(tmp_path))
     s = OzonService(use_session=True)
     s._crawl_parser = HangingParser()
+    s._search_parser = HangingParser()
     return s
 
 
+def _block_infos(tmp_path):
+    return [json.loads(p.read_text(encoding="utf-8"))
+            for p in sorted(tmp_path.iterdir()) if p.name.endswith(".json")]
+
+
 def test_listing_timeout_is_page_load_failure(service, tmp_path):
-    parser = service._crawl_parser
+    search, crawl = service._search_parser, service._crawl_parser
     with pytest.raises(PageLoadError) as e:
         service._listing_in_session("https://www.ozon.ru/search/?text=x", 0)
     assert _failure_kind(e.value) == "load"
-    assert parser.closed and parser.steps == 1
-    assert service._crawl_parser is None
-    assert any(p.name.endswith(".json") for p in tmp_path.iterdir())
+    assert search.closed and search.steps == 1
+    assert service._search_parser is None
+    assert service._crawl_parser is crawl and not crawl.closed
+    assert [i["session"] for i in _block_infos(tmp_path)] == ["search"]
 
 
-def test_crawl_timeout_is_page_load_failure(service):
-    parser = service._crawl_parser
+def test_crawl_timeout_is_page_load_failure(service, tmp_path):
+    search, crawl = service._search_parser, service._crawl_parser
     with pytest.raises(PageLoadError):
         service.get_card_for_crawl("https://www.ozon.ru/product/1/")
-    assert parser.closed
+    assert crawl.closed
     assert service._crawl_parser is None
+    assert service._search_parser is search and not search.closed
+    assert [i["session"] for i in _block_infos(tmp_path)] == ["crawl"]

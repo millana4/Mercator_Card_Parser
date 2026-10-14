@@ -50,21 +50,23 @@ WINDOWS_UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
 ACCEPT_LANGUAGE = "ru-RU,ru,en-US,en"
 
 # Подмены устройства: выполняются до скриптов каждой новой страницы.
-# Строки видеокарты WebGL, navigator.deviceMemory, screen.availHeight.
-# Подменённые функции и геттеры при toString() показывают текст оригинала,
-# как встроенные («function getParameter() { [native code] }»).
+# Строки видеокарты WebGL (CFG.webglSpoof), navigator.deviceMemory, screen.availHeight.
+# При CFG.toStringProxy подменённые функции и геттеры при toString() показывают
+# текст оригинала, как встроенные («function getParameter() { [native code] }»).
 _DEVICE_PATCH_JS = """
 (() => {
   const CFG = __CFG__;
   const originals = new WeakMap();
-  const nativeToString = Function.prototype.toString;
-  const toStringProxy = new Proxy(nativeToString, {
-    apply(target, self, args) {
-      return Reflect.apply(target, originals.get(self) || self, args);
-    },
-  });
-  originals.set(toStringProxy, nativeToString);
-  Function.prototype.toString = toStringProxy;
+  if (CFG.toStringProxy) {
+    const nativeToString = Function.prototype.toString;
+    const toStringProxy = new Proxy(nativeToString, {
+      apply(target, self, args) {
+        return Reflect.apply(target, originals.get(self) || self, args);
+      },
+    });
+    originals.set(toStringProxy, nativeToString);
+    Function.prototype.toString = toStringProxy;
+  }
 
   const wrap = (fn, apply) => {
     const proxy = new Proxy(fn, {apply});
@@ -84,8 +86,10 @@ _DEVICE_PATCH_JS = """
       return Reflect.apply(target, self, args);
     });
   };
-  patchWebGL(window.WebGLRenderingContext && WebGLRenderingContext.prototype);
-  patchWebGL(window.WebGL2RenderingContext && WebGL2RenderingContext.prototype);
+  if (CFG.webglSpoof) {
+    patchWebGL(window.WebGLRenderingContext && WebGLRenderingContext.prototype);
+    patchWebGL(window.WebGL2RenderingContext && WebGL2RenderingContext.prototype);
+  }
   patchGetter(window.Navigator && Navigator.prototype, 'deviceMemory', CFG.deviceMemory);
   patchGetter(window.Screen && Screen.prototype, 'availHeight', CFG.availHeight);
 })();
@@ -117,18 +121,76 @@ def chrome_brands(full_version: str) -> tuple[list[dict], list[dict]]:
     return brands, full_list
 
 
+
+
+# --- Переключатели подмен отпечатка (OZON_FP_*, см. config.py) ---
+# WebGL: spoof — программный WebGL (SwiftShader) и строка видеокарты из профиля
+# устройства; native — программный WebGL без подмены строки (видна SwiftShader);
+# off — WebGL выключен, как в коде до 13.10 (--disable-gpu, без SwiftShader).
+
+
+def chrome_gl_args(webgl_mode: str) -> list[str]:
+    """Флаги Chrome для режима WebGL."""
+    if webgl_mode == "off":
+        return ["--disable-gpu"]
+    # Программный WebGL: GPU на сервере нет, без этих флагов WebGL недоступен.
+    return ["--use-gl=angle", "--use-angle=swiftshader", "--enable-unsafe-swiftshader"]
+
+
+def device_patch_js(device: DeviceProfile, webgl_mode: str, tostring_proxy: bool) -> str:
+    """Скрипт подмен устройства для Page.addScriptToEvaluateOnNewDocument."""
+    cfg = {
+        "webglSpoof": webgl_mode == "spoof",
+        "toStringProxy": bool(tostring_proxy),
+        "webglVendor": device.webgl_vendor,
+        "webglRenderer": device.webgl_renderer,
+        "deviceMemory": device.memory,
+        "availHeight": device.avail_height,
+    }
+    return _DEVICE_PATCH_JS.replace("__CFG__", json.dumps(cfg, ensure_ascii=False))
+
+
+def ua_override(full_version: str, client_hints: bool) -> dict:
+    """Параметры Emulation.setUserAgentOverride: User-Agent и navigator.platform
+    Windows 10 x64; с client_hints — ещё userAgentMetadata (марки по алгоритму
+    Chromium, Windows 10, x86/64). Без client_hints Client Hints не подменяются."""
+    major = full_version.split(".")[0]
+    override = {
+        "userAgent": WINDOWS_UA.format(major=major),
+        "acceptLanguage": ACCEPT_LANGUAGE,
+        "platform": "Win32",
+    }
+    if client_hints:
+        brands, full_list = chrome_brands(full_version)
+        override["userAgentMetadata"] = {
+            "brands": brands,
+            "fullVersionList": full_list,
+            "fullVersion": full_version,
+            "platform": "Windows",
+            "platformVersion": "10.0.0",
+            "architecture": "x86",
+            "model": "",
+            "mobile": False,
+            "bitness": "64",
+            "wow64": False,
+        }
+    return override
+
+
 class OzonParser:
     """Драйвер + получение HTML + извлечение __NUXT__ для одной карточки Ozon."""
 
-    def __init__(self, policy: MarketplacePolicy, device: DeviceProfile | None = None):
+    def __init__(self, policy: MarketplacePolicy, device: DeviceProfile | None = None,
+                 profile_dir: str | None = None):
         self.policy = policy
         self.device = device or pick_device(os.environ.get("PARSER_ID", "0"), 0)
         self.driver = None
         self.wait = None
         self.display: VirtualDisplay | None = None
         # Постоянный профиль (том): кука-пропуск антибота переживает карточки и
-        # рестарты. Если путь не задан — временный профиль.
-        persistent = os.environ.get("OZON_CHROME_PROFILE_DIR")
+        # рестарты. profile_dir задаёт сервис для своей сессии ("" — временный
+        # профиль); None — как раньше, из OZON_CHROME_PROFILE_DIR.
+        persistent = os.environ.get("OZON_CHROME_PROFILE_DIR") if profile_dir is None else profile_dir
         if persistent:
             os.makedirs(persistent, exist_ok=True)
             self.chrome_temp_dir = persistent
@@ -188,10 +250,8 @@ class OzonParser:
         opts.add_argument("--window-position=0,0")
         opts.add_argument("--lang=ru-RU")
         opts.add_argument("--disable-blink-features=AutomationControlled")
-        # Программный WebGL: GPU на сервере нет, без этих флагов WebGL недоступен.
-        opts.add_argument("--use-gl=angle")
-        opts.add_argument("--use-angle=swiftshader")
-        opts.add_argument("--enable-unsafe-swiftshader")
+        for arg in chrome_gl_args(self.policy.fp_webgl):
+            opts.add_argument(arg)
         if major:
             # UA для всех запросов браузера, включая воркеры; Client Hints и platform — через CDP.
             opts.add_argument(f"--user-agent={WINDOWS_UA.format(major=major)}")
@@ -212,49 +272,32 @@ class OzonParser:
         service = Service("/usr/local/bin/chromedriver", env=env)
         self.driver = webdriver.Chrome(service=service, options=opts)
         self._apply_windows_profile()
-        logger.info("Драйвер Chrome инициализирован (headless=%s, устройство=%s, %sx%s)",
+        logger.info("Драйвер Chrome инициализирован (headless=%s, устройство=%s, %sx%s; "
+                    "подмены: WebGL=%s, toString=%s, Client Hints=%s)",
                     self.policy.headless, self.device.name,
-                    self.device.width, self.device.height)
+                    self.device.width, self.device.height, self.policy.fp_webgl,
+                    "proxy" if self.policy.fp_tostring_proxy else "нет",
+                    "да" if self.policy.fp_client_hints else "нет")
 
     def _apply_windows_profile(self) -> None:
-        """Подмены через CDP: User-Agent, Client Hints и navigator.platform —
-        Windows 10 x64 с версией установленного Chrome; число ядер, память,
-        видеокарта WebGL и доступная высота экрана — из профиля устройства.
-        Марки Client Hints строятся по алгоритму Chromium (chrome_brands)."""
+        """Подмены через CDP: User-Agent и navigator.platform — Windows 10 x64
+        с версией установленного Chrome; Client Hints — при OZON_FP_CLIENT_HINTS;
+        число ядер, память, доступная высота экрана — из профиля устройства;
+        видеокарта WebGL — при OZON_FP_WEBGL=spoof; Proxy на toString —
+        при OZON_FP_TOSTRING_PROXY. Марки Client Hints — по алгоритму Chromium."""
         full_version = self.driver.capabilities.get("browserVersion", "")
         major = full_version.split(".")[0]
         env_major = (os.environ.get("CHROME_VERSION") or "").split(".")[0]
         if env_major and env_major != major:
             logger.warning("CHROME_VERSION=%s не совпадает с версией браузера %s",
                            env_major, full_version)
-        brands, full_list = chrome_brands(full_version)
 
-        self.driver.execute_cdp_cmd("Emulation.setUserAgentOverride", {
-            "userAgent": WINDOWS_UA.format(major=major),
-            "acceptLanguage": ACCEPT_LANGUAGE,
-            "platform": "Win32",
-            "userAgentMetadata": {
-                "brands": brands,
-                "fullVersionList": full_list,
-                "fullVersion": full_version,
-                "platform": "Windows",
-                "platformVersion": "10.0.0",
-                "architecture": "x86",
-                "model": "",
-                "mobile": False,
-                "bitness": "64",
-                "wow64": False,
-            },
-        })
+        self.driver.execute_cdp_cmd("Emulation.setUserAgentOverride",
+                                    ua_override(full_version, self.policy.fp_client_hints))
         self.driver.execute_cdp_cmd("Emulation.setHardwareConcurrencyOverride",
                                     {"hardwareConcurrency": self.device.cores})
-        cfg = {
-            "webglVendor": self.device.webgl_vendor,
-            "webglRenderer": self.device.webgl_renderer,
-            "deviceMemory": self.device.memory,
-            "availHeight": self.device.avail_height,
-        }
-        patch_js = _DEVICE_PATCH_JS.replace("__CFG__", json.dumps(cfg, ensure_ascii=False))
+        patch_js = device_patch_js(self.device, self.policy.fp_webgl,
+                                   self.policy.fp_tostring_proxy)
         self.driver.execute_cdp_cmd("Page.addScriptToEvaluateOnNewDocument", {"source": patch_js})
 
     # ------------------------------------------------------------------ #

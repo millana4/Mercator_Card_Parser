@@ -44,6 +44,12 @@ def _get_str(key: str, default: str) -> str:
     return val if val is not None and val.strip() != "" else default
 
 
+def _get_choice(key: str, default: str, choices: tuple[str, ...]) -> str:
+    """Значение из списка допустимых (без учёта регистра); иначе — дефолт."""
+    val = _get_str(key, default).strip().lower()
+    return val if val in choices else default
+
+
 @dataclass
 class MarketplacePolicy:
     """Политика парсинга одного маркетплейса: таймауты, паузы, ретраи."""
@@ -73,6 +79,10 @@ class MarketplacePolicy:
     search_tiles_target: int = 32       # снимок выдачи: сколько плиток набирать прокруткой
     search_max_scrolls: int = 10        # снимок выдачи: потолок прокруток
     full_content_timeout: float = 15.0  # сек: сколько ждать полный блок характеристик при полном разборе
+    # Переключатели подмен отпечатка (опыт по одной; по умолчанию — как сейчас)
+    fp_webgl: str = "spoof"             # spoof — WebGL + строка видеокарты профиля; native — WebGL без подмены; off — WebGL выключен
+    fp_tostring_proxy: bool = True      # Proxy на Function.prototype.toString (подмены выглядят встроенными)
+    fp_client_hints: bool = True        # Client Hints Windows через CDP (userAgentMetadata)
 
 
 class Settings:
@@ -115,6 +125,9 @@ class Settings:
             search_tiles_target=_get_int("OZON_SEARCH_TILES_TARGET", 32),
             search_max_scrolls=_get_int("OZON_SEARCH_MAX_SCROLLS", 10),
             full_content_timeout=_get_float("OZON_FULL_CONTENT_TIMEOUT", 15.0),
+            fp_webgl=_get_choice("OZON_FP_WEBGL", "spoof", ("spoof", "native", "off")),
+            fp_tostring_proxy=_get_bool("OZON_FP_TOSTRING_PROXY", True),
+            fp_client_hints=_get_bool("OZON_FP_CLIENT_HINTS", True),
         )
 
 

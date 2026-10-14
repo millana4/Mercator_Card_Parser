@@ -8,14 +8,19 @@ consumer.py — цикл потребления задач из Redis.
 любой свободный воркер берёт следующую задачу, воркер на паузе после бана
 задачи не тянет — их разбирают остальные.
 
-Все задачи идут в одной долгоживущей сессии браузера. Реакция на блокировку:
+Задачи идут в двух долгоживущих сессиях браузера (см. OzonService):
+обход — в сессии обхода, снимки выдачи и подбор — в сессии выдачи.
+Реакция на блокировку:
   - капча/блок (ban) — сразу бан;
   - сбой загрузки (load) — браузер пересоздаётся; load_failure_threshold
     сбоев подряд — бан;
-  - бан: сброс профиля браузера и пауза ban_pause_start_s × 2^(уровень−1),
-    не больше ban_pause_max_s; уровень обнуляется после ban_level_reset_s
-    без бана. Состояние в Redis — перезапуск воркера паузу не обнуляет.
-    Первая задача после паузы — пробная.
+  - бан: пауза ban_pause_start_s × 2^(уровень−1), не больше ban_pause_max_s;
+    уровень обнуляется после ban_level_reset_s без бана. Сбрасываются профиль
+    и устройство той сессии, где пойман бан; другая сессия не трогается.
+  - пробная задача после паузы берётся только из очереди обхода: выдача
+    и подбор — со следующей задачи.
+Уровень, пауза и поколения устройств хранятся только в памяти процесса:
+перезапуск воркера их обнуляет (баны редкие, решаются ротацией IP).
 
 Подключение к Redis отказоустойчивое: ждёт Redis и переживает его падения.
 """
@@ -27,7 +32,7 @@ import random
 import redis
 
 from app.core.logging import get_logger
-from app.marketplaces.ozon.service import OzonService
+from app.marketplaces.ozon.service import CRAWL, SEARCH, OzonService
 from app.worker.ban_policy import ban_pause_s, next_ban_level
 from app.worker.redis_config import redis_worker_settings as rws
 from app.worker.result_producer import ResultProducer
@@ -35,17 +40,23 @@ from app.worker.handlers import handle_select, handle_parse, handle_search
 
 logger = get_logger(__name__)
 
+# Поток задачи -> сессия браузера, в которой она выполняется.
+SESSION_BY_STREAM = {"parse": CRAWL, "search": SEARCH, "select": SEARCH}
+
 
 class TaskConsumer:
     def __init__(self):
-        # Одна долгоживущая сессия браузера и один профиль на все задачи:
-        # подбор, выдача, обход.
+        # Две долгоживущие сессии браузера: обход и выдача (снимки, подбор).
         self.service = OzonService(use_session=True)
         self.producer = ResultProducer()
         self.redis = None               # подключим в run(), с повторами
         self._running = True
         self._load_failures = 0         # сбоев загрузки подряд
         self._banned_until = 0.0        # конец текущей паузы после бана (epoch, сек)
+        self._ban_level = 0             # уровень бана: какой бан подряд (0 — банов не было)
+        self._probe_pending = False     # следующая задача — пробная, только из очереди обхода
+        # Поколение устройства по сессиям: растёт при бане своей сессии.
+        self._generations = {CRAWL: 0, SEARCH: 0}
         self._policy = self.service.policy
         # Ключ задачи -> (поток, маркетплейс). Считаем один раз при старте.
         self._routes = rws.key_routes
@@ -89,7 +100,6 @@ class TaskConsumer:
                 self.redis = self._connect_redis()
                 if self.redis is None:
                     break  # остановили во время ожидания Redis
-                self._load_ban_state()
             try:
                 self._consume_loop()
             except redis.exceptions.RedisError as e:
@@ -112,10 +122,13 @@ class TaskConsumer:
                 continue  # пауза после бана отсижена — проверяем флаг и берём пробную задачу
             # BRPOP блокируется до задачи или таймаута; таймаут → проверяем _running.
             # Список ключей: Redis отдаёт из первого непустого (приоритет select).
-            popped = self.redis.brpop(rws.task_keys, timeout=rws.brpop_timeout_s)
+            # Пробная задача после паузы — только из очереди обхода.
+            keys = rws.parse_task_keys if self._probe_pending else rws.task_keys
+            popped = self.redis.brpop(keys, timeout=rws.brpop_timeout_s)
             if popped is None:
                 continue  # таймаут — задач нет, проверяем флаг и ждём дальше
             key, raw = popped
+            self._probe_pending = False  # пробная задача взята; новый бан снова её назначит
             self._process_one(key, raw)
 
     def _process_one(self, key: str, raw: str) -> None:
@@ -167,87 +180,52 @@ class TaskConsumer:
         else:
             self.producer.incr_counter(rws.counter_done(marketplace))
 
-        # Все потоки идут в одной сессии браузера: блокировка в любом — блокировка IP.
-        self._track_failure(failure, marketplace)
+        # Пауза общая на воркер; профиль и устройство сбрасываются у сессии задачи.
+        self._track_failure(failure, SESSION_BY_STREAM.get(stream, CRAWL))
         if time.time() < self._banned_until:
             return  # пауза после бана — в начале следующей итерации цикла
         self._pause_between_cards()
 
     # ------------------------------------------------------------------ #
-    def _track_failure(self, failure: str | None, marketplace: str) -> None:
+    def _track_failure(self, failure: str | None, session: str) -> None:
         """Учёт блокировок: ban — сразу бан; load — бан после серии сбоев подряд;
-        любой другой исход (страница загрузилась) обнуляет серию сбоев."""
+        любой другой исход (страница загрузилась) обнуляет серию сбоев.
+        session — сессия браузера задачи: у неё сбрасываются профиль и устройство."""
         if failure == "ban":
-            self._register_ban(marketplace, "капча или блокировка")
+            self._register_ban("капча или блокировка", session)
         elif failure == "load":
             self._load_failures += 1
             threshold = self._policy.load_failure_threshold
             logger.warning("Сбой загрузки подряд: %s/%s", self._load_failures, threshold)
             if self._load_failures >= threshold:
-                self._register_ban(marketplace, f"сбоев загрузки подряд: {self._load_failures}")
+                self._register_ban(f"сбоев загрузки подряд: {self._load_failures}", session)
         else:
             self._load_failures = 0
 
-    def _register_ban(self, marketplace: str, reason: str) -> None:
+    def _register_ban(self, reason: str, session: str) -> None:
         """Бан: рассчитать уровень и паузу, перейти на следующее устройство
-        браузера, записать состояние в Redis, сбросить профиль браузера.
-        Сама пауза — в _wait_ban_pause."""
+        в сессии бана, сбросить профиль этой сессии. Пауза общая на воркер —
+        в _wait_ban_pause. Уровень растёт, если с конца прошлой паузы прошло
+        меньше ban_level_reset_s, иначе снова 1."""
         now = time.time()
-        key = rws.ban_state_key(marketplace)
-        prev_level, prev_until, prev_generation = 0, 0.0, 0
-        try:
-            state = self.redis.hgetall(key) if self.redis is not None else {}
-            prev_level = int(float(state.get("level", 0)))
-            prev_until = float(state.get("until", 0))
-            prev_generation = int(float(state.get("generation", 0)))
-        except Exception as e:
-            logger.warning("Не удалось прочитать состояние бана %s: %s", key, e)
-
-        level = next_ban_level(prev_level, prev_until, now, self._policy.ban_level_reset_s)
+        level = next_ban_level(self._ban_level, self._banned_until, now,
+                               self._policy.ban_level_reset_s)
         pause = ban_pause_s(level, self._policy.ban_pause_start_s, self._policy.ban_pause_max_s)
-        until = now + pause
-        generation = prev_generation + 1
-        self._banned_until = max(self._banned_until, until)
+        self._ban_level = level
+        self._banned_until = now + pause
         self._load_failures = 0
+        self._generations[session] += 1
 
+        logger.warning("БАН (%s, сессия %s): уровень %s, пауза %.0f мин до %s — новое устройство "
+                       "(поколение %s), сбрасываю профиль сессии",
+                       reason, session, level, pause / 60,
+                       time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(self._banned_until)),
+                       self._generations[session])
         try:
-            if self.redis is not None:
-                self.redis.hset(key, mapping={"level": level, "until": until,
-                                              "banned_at": now, "reason": reason,
-                                              "generation": generation})
-        except Exception as e:
-            logger.warning("Не удалось записать состояние бана %s: %s", key, e)
-
-        logger.warning("БАН (%s): уровень %s, пауза %.0f мин до %s — новое устройство "
-                       "(поколение %s), сбрасываю профиль браузера",
-                       reason, level, pause / 60,
-                       time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(until)), generation)
-        try:
-            self.service.set_device_generation(generation)
-            self.service.reset_profile()
+            self.service.set_device_generation(self._generations[session], session)
+            self.service.reset_profile(session)
         except Exception as e:
             logger.warning("Ошибка смены устройства или сброса профиля браузера: %s", e)
-
-    def _load_ban_state(self) -> None:
-        """При подключении к Redis восстановить незакончившуюся паузу после бана
-        и поколение устройства браузера."""
-        generation = 0
-        for marketplace in rws.marketplaces:
-            key = rws.ban_state_key(marketplace)
-            try:
-                state = self.redis.hgetall(key)
-                until = float(state.get("until", 0))
-                generation = max(generation, int(float(state.get("generation", 0))))
-            except Exception as e:
-                logger.warning("Не удалось прочитать состояние бана %s: %s", key, e)
-                continue
-            if until > time.time():
-                self._banned_until = max(self._banned_until, until)
-                logger.warning("Восстановлена пауза после бана: площадка=%s, уровень=%s, до %s",
-                               marketplace, state.get("level"),
-                               time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(until)))
-        self.service.set_device_generation(generation)
-        logger.info("Поколение устройства браузера: %s", generation)
 
     def _wait_ban_pause(self) -> bool:
         """Если идёт пауза после бана — отсидеть её (прерываемо). True, если ждали."""
@@ -257,7 +235,8 @@ class TaskConsumer:
         logger.warning("Пауза после бана: %.0f мин — задачи не беру", remaining / 60)
         self._interruptible_sleep(remaining)
         if self._running:
-            logger.info("Пауза после бана окончена — следующая задача пробная")
+            self._probe_pending = True
+            logger.info("Пауза после бана окончена — следующая задача пробная (из очереди обхода)")
         return True
 
     def _pause_between_cards(self) -> None:
