@@ -79,6 +79,7 @@ class MarketplacePolicy:
     search_tiles_target: int = 32       # снимок выдачи: сколько плиток набирать прокруткой
     search_max_scrolls: int = 10        # снимок выдачи: потолок прокруток
     full_content_timeout: float = 15.0  # сек: сколько ждать полный блок характеристик при полном разборе
+    search_task_max_age_s: float = 21600.0  # сек: задача выдачи старше (от run_at) не выполняется
     # Переключатели подмен отпечатка (опыт по одной; по умолчанию — как сейчас)
     fp_webgl: str = "spoof"             # spoof — WebGL + строка видеокарты профиля; native — WebGL без подмены; off — WebGL выключен
     fp_tostring_proxy: bool = True      # Proxy на Function.prototype.toString (подмены выглядят встроенными)
@@ -113,8 +114,8 @@ class Settings:
             reserve_between_cards_max=_get_float("OZON_RESERVE_BETWEEN_CARDS_MAX", 80.0),
             load_failure_threshold=_get_int("OZON_LOAD_FAILURE_THRESHOLD", 3),
             ban_pause_start_s=_get_float("OZON_BAN_PAUSE_START_S", 600.0),
-            ban_pause_max_s=_get_float("OZON_BAN_PAUSE_MAX_S", 86400.0),
-            ban_level_reset_s=_get_float("OZON_BAN_LEVEL_RESET_S", 86400.0),
+            ban_pause_max_s=_get_float("OZON_BAN_PAUSE_MAX_S", 7200.0),
+            ban_level_reset_s=_get_float("OZON_BAN_LEVEL_RESET_S", 21600.0),
             block_artifacts_keep=_get_int("OZON_BLOCK_ARTIFACTS_KEEP", 50),
             session_min=_get_int("OZON_SESSION_MIN", 20),
             session_max=_get_int("OZON_SESSION_MAX", 50),
@@ -125,6 +126,7 @@ class Settings:
             search_tiles_target=_get_int("OZON_SEARCH_TILES_TARGET", 32),
             search_max_scrolls=_get_int("OZON_SEARCH_MAX_SCROLLS", 10),
             full_content_timeout=_get_float("OZON_FULL_CONTENT_TIMEOUT", 15.0),
+            search_task_max_age_s=_get_float("OZON_SEARCH_TASK_MAX_AGE_S", 21600.0),
             fp_webgl=_get_choice("OZON_FP_WEBGL", "spoof", ("spoof", "native", "off")),
             fp_tostring_proxy=_get_bool("OZON_FP_TOSTRING_PROXY", True),
             fp_client_hints=_get_bool("OZON_FP_CLIENT_HINTS", True),

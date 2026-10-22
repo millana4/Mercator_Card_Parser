@@ -4,9 +4,10 @@ handlers.py — обработчики задач select, search и parse.
 Транспортный переходник: задача → вызов OzonService → результат с эхо-полями.
 Логику подбора/парсинга не меняет.
 
-Внутреннее поле результата "_failure" (ban | load | None) сообщает воркеру,
-была ли блокировка или сбой загрузки; воркер убирает его перед отправкой в ядро.
-Для ядра оба случая — error_code=antibot_blocked («повторить позже»).
+Внутреннее поле результата "_failure" (ban | load | expired | None) сообщает
+воркеру, была ли блокировка, сбой загрузки или устаревшая задача выдачи; воркер
+убирает его перед отправкой в ядро. Для ядра ban и load — error_code=antibot_blocked
+(«повторить позже»), expired — error_code=expired (задача не выполнялась).
 """
 
 from datetime import datetime, timezone
@@ -97,6 +98,16 @@ def handle_search(task: dict, service: OzonService) -> dict:
     logger.info("SEARCH задача | task_id=%s set_id=%s stratum_id=%s query=%r",
                 echo["task_id"], echo["set_id"], echo["stratum_id"], echo["query"])
     empty = {"scrolls": 0, "tiles_total": 0, "tiles": []}
+    # Устаревшая задача (парсеры долго стояли, задачи накопились) — на Ozon не ходим:
+    # иначе вернувшийся парсер выполнит пачку выдач подряд.
+    max_age = getattr(getattr(service, "policy", None), "search_task_max_age_s", None)
+    age = _task_age_s(echo["run_at"])
+    if max_age and age is not None and age > max_age:
+        logger.info("SEARCH задача устарела (%.1f ч от run_at) — пропускаю | task_id=%s query=%r",
+                    age / 3600, echo["task_id"], echo["query"])
+        return {**echo, **empty, "ok": False, "parsed_at": _now(),
+                "error": f"Задача выдачи устарела: {age / 3600:.1f} ч от run_at",
+                "error_code": "expired", "_failure": "expired"}
     if not echo["query"]:
         logger.warning("SEARCH задача без query | task_id=%s", echo["task_id"])
         return {**echo, **empty, "ok": False, "parsed_at": _now(),
@@ -164,6 +175,19 @@ def _failure_kind(e: Exception) -> str | None:
     if isinstance(e, AntibotBlockedError):
         return "ban"
     return None
+
+
+def _task_age_s(run_at: str | None) -> float | None:
+    """Сколько секунд прошло с run_at (ISO с поясом). None — нет или не разобрать."""
+    if not run_at:
+        return None
+    try:
+        ts = datetime.fromisoformat(run_at)
+    except ValueError:
+        return None
+    if ts.tzinfo is None:
+        ts = ts.replace(tzinfo=timezone.utc)
+    return (datetime.now(timezone.utc) - ts).total_seconds()
 
 
 def _now() -> str:

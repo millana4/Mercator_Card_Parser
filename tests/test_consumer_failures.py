@@ -1,19 +1,19 @@
 # -*- coding: utf-8 -*-
-"""Учёт блокировок воркером: бан сразу, серия сбоев загрузки, уровень и пауза
-в памяти процесса, сброс профиля и устройства только у сессии бана,
-пробная задача после паузы — из очереди обхода."""
+"""Учёт блокировок воркером: две полосы пауз (обход; выдача и подбор), бан сразу,
+серия сбоев загрузки, уровень и пауза полосы в памяти процесса, сброс профиля
+и устройства у сессии потока, пробная задача после паузы обхода."""
 import time
 from types import SimpleNamespace
 
 from app.core.exceptions import AntibotBlockedError, PageLoadError, ProductNotFoundError
 from app.marketplaces.ozon.service import CRAWL, SEARCH
-from app.worker.consumer import SESSION_BY_STREAM, TaskConsumer
+from app.worker.consumer import LANE_BY_STREAM, SESSION_BY_STREAM, LaneState, TaskConsumer
 from app.worker.handlers import _error_code, _failure_kind
 from app.worker.redis_config import redis_worker_settings as rws
 
-DAY = 86400.0
+HOUR = 3600.0
 POLICY = SimpleNamespace(load_failure_threshold=3, ban_pause_start_s=600.0,
-                         ban_pause_max_s=DAY, ban_level_reset_s=DAY)
+                         ban_pause_max_s=2 * HOUR, ban_level_reset_s=6 * HOUR)
 
 
 class FakeService:
@@ -47,9 +47,8 @@ def make_consumer():
     consumer = TaskConsumer.__new__(TaskConsumer)
     consumer._policy = POLICY
     consumer._running = True
-    consumer._load_failures = 0
-    consumer._banned_until = 0.0
-    consumer._ban_level = 0
+    consumer._lanes = {CRAWL: LaneState(), SEARCH: LaneState()}
+    consumer._search_paused = False
     consumer._probe_pending = False
     consumer._generations = {CRAWL: 0, SEARCH: 0}
     consumer.service = FakeService()
@@ -63,60 +62,75 @@ def test_failure_kind_and_code():
     assert _error_code(PageLoadError("x")) == "antibot_blocked"
 
 
-def test_stream_to_session():
-    assert SESSION_BY_STREAM == {"parse": CRAWL, "search": SEARCH, "select": SEARCH}
+def test_lanes_and_sessions_by_stream():
+    assert LANE_BY_STREAM == {"parse": CRAWL, "search": SEARCH, "select": SEARCH}
+    assert SESSION_BY_STREAM == {"parse": CRAWL, "search": SEARCH, "select": None}
 
 
-def test_ban_registered_immediately():
+def test_ban_registered_immediately_in_stream_lane():
     consumer = make_consumer()
     bans = []
-    consumer._register_ban = lambda reason, session: bans.append(session)
-    consumer._track_failure("ban", SEARCH)
-    assert bans == [SEARCH]
+    consumer._register_ban = lambda lane, stream, reason: bans.append((lane, stream))
+    consumer._track_failure("ban", "select")
+    assert bans == [(SEARCH, "select")]
 
 
-def test_load_failures_threshold_and_reset():
+def test_load_failures_counted_per_lane():
     consumer = make_consumer()
     bans = []
-    consumer._register_ban = lambda reason, session: bans.append(session)
-    consumer._track_failure("load", CRAWL)
-    consumer._track_failure("load", CRAWL)
-    consumer._track_failure(None, CRAWL)        # страница загрузилась — серия обнулена
-    consumer._track_failure("load", CRAWL)
-    consumer._track_failure("load", CRAWL)
+    consumer._register_ban = lambda lane, stream, reason: bans.append(lane)
+    consumer._track_failure("load", "parse")
+    consumer._track_failure("load", "parse")
+    consumer._track_failure("load", "search")   # своя полоса — серия обхода не растёт
+    consumer._track_failure(None, "parse")      # страница загрузилась — серия обхода обнулена
+    consumer._track_failure("load", "parse")
+    consumer._track_failure("load", "parse")
     assert bans == []
-    consumer._track_failure("load", CRAWL)
+    consumer._track_failure("load", "parse")
     assert bans == [CRAWL]
 
 
-def test_register_ban_levels_and_pause():
+def test_search_ban_keeps_crawl_running():
     consumer = make_consumer()
     start = time.time()
-    consumer._register_ban("капча", SEARCH)
-    assert consumer._ban_level == 1
-    assert 590 <= consumer._banned_until - start <= 610
-    consumer._register_ban("капча", SEARCH)
-    assert consumer._ban_level == 2
-    assert 1190 <= consumer._banned_until - start <= 1210
-    assert consumer.service.generations == [(1, SEARCH), (2, SEARCH)]
-    assert consumer.service.resets == [SEARCH, SEARCH]
+    consumer._register_ban(SEARCH, "search", "капча")
+    assert consumer._lanes[CRAWL].until == 0.0
+    assert 590 <= consumer._lanes[SEARCH].until - start <= 610
+    assert consumer._wait_ban_pause() is False          # обход не на паузе
+    assert consumer.service.resets == [SEARCH]
+    assert consumer.service.generations == [(1, SEARCH)]
 
 
-def test_ban_changes_only_own_session():
+def test_select_ban_resets_nothing():
     consumer = make_consumer()
-    consumer._register_ban("капча", SEARCH)
-    consumer._register_ban("капча", CRAWL)
-    assert consumer._generations == {CRAWL: 1, SEARCH: 1}
-    assert consumer.service.generations == [(1, SEARCH), (1, CRAWL)]
-    assert consumer.service.resets == [SEARCH, CRAWL]
+    consumer._register_ban(SEARCH, "select", "капча")
+    assert consumer._lanes[SEARCH].level == 1
+    assert consumer.service.resets == [] and consumer.service.generations == []
 
 
-def test_level_resets_after_quiet_day():
+def test_crawl_ban_pauses_worker_and_resets_crawl():
     consumer = make_consumer()
-    consumer._ban_level = 5
-    consumer._banned_until = time.time() - DAY - 1   # пауза кончилась больше суток назад
-    consumer._register_ban("капча", CRAWL)
-    assert consumer._ban_level == 1
+    consumer._register_ban(CRAWL, "parse", "капча")
+    assert consumer._lanes[CRAWL].until > time.time()
+    assert consumer._lanes[SEARCH].until == 0.0
+    assert consumer.service.resets == [CRAWL]
+
+
+def test_levels_independent_and_capped():
+    consumer = make_consumer()
+    for _ in range(6):
+        consumer._register_ban(SEARCH, "select", "капча")
+    assert consumer._lanes[SEARCH].level == 6
+    assert consumer._lanes[SEARCH].until - time.time() <= 2 * HOUR + 1   # потолок 2 ч
+    assert consumer._lanes[CRAWL].level == 0
+
+
+def test_level_resets_after_quiet_period():
+    consumer = make_consumer()
+    consumer._lanes[SEARCH].level = 5
+    consumer._lanes[SEARCH].until = time.time() - 6 * HOUR - 1   # 6 ч без бана после паузы
+    consumer._register_ban(SEARCH, "select", "капча")
+    assert consumer._lanes[SEARCH].level == 1
 
 
 def _one_iteration(consumer):
@@ -132,31 +146,38 @@ def _one_iteration(consumer):
     return taken
 
 
-def test_probe_task_taken_from_parse_queue():
-    search_key, parse_key = rws.search_tasks_key("ozon"), rws.parse_tasks_key("ozon")
+def _queues():
+    return {rws.select_tasks_key("ozon"): ["{}"], rws.search_tasks_key("ozon"): ["{}"],
+            rws.parse_tasks_key("ozon"): ["{}"]}
+
+
+def test_search_lane_paused_takes_only_parse():
     consumer = make_consumer()
-    consumer.redis = FakeRedis({search_key: ["{}"], parse_key: ["{}"]})
-    consumer._probe_pending = True
-    assert _one_iteration(consumer) == [parse_key]
+    consumer.redis = FakeRedis(_queues())
+    consumer._register_ban(SEARCH, "select", "капча")
+    assert _one_iteration(consumer) == [rws.parse_tasks_key("ozon")]
     assert consumer.redis.calls == [rws.parse_task_keys]
+
+
+def test_search_lane_pause_end_restores_priority():
+    consumer = make_consumer()
+    consumer.redis = FakeRedis(_queues())
+    consumer._lanes[SEARCH].until = time.time() - 1
+    consumer._search_paused = True
+    assert _one_iteration(consumer) == [rws.select_tasks_key("ozon")]
+    assert consumer._search_paused is False
+
+
+def test_probe_task_after_crawl_pause_from_parse_queue():
+    consumer = make_consumer()
+    consumer.redis = FakeRedis(_queues())
+    consumer._probe_pending = True
+    assert _one_iteration(consumer) == [rws.parse_tasks_key("ozon")]
     assert consumer._probe_pending is False
 
 
-def test_regular_task_follows_priority():
-    search_key, parse_key = rws.search_tasks_key("ozon"), rws.parse_tasks_key("ozon")
+def test_crawl_pause_end_makes_next_task_probe():
     consumer = make_consumer()
-    consumer.redis = FakeRedis({search_key: ["{}"], parse_key: ["{}"]})
-    assert _one_iteration(consumer) == [search_key]
-    assert consumer.redis.calls == [rws.task_keys]
-
-
-def test_pause_end_makes_next_task_probe():
-    consumer = make_consumer()
-    consumer._banned_until = time.time() + 0.05
+    consumer._lanes[CRAWL].until = time.time() + 0.05
     assert consumer._wait_ban_pause() is True
     assert consumer._probe_pending is True
-
-
-def test_parse_task_keys_only_parse():
-    assert rws.parse_task_keys == [rws.parse_tasks_key(m) for m in rws.marketplaces]
-    assert all(k.startswith("parse:") for k in rws.parse_task_keys)

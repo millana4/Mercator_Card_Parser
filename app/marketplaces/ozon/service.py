@@ -12,11 +12,14 @@ service.py — бизнес-логика парсинга Ozon (оркестра
   - use_session=True (воркер и HTTP API): две долгоживущие сессии браузера,
     у каждой свой профиль и свой экран Xvfb:
       * сессия обхода  — главная и карточки обхода (get_card_for_crawl);
-      * сессия выдачи  — главная, страницы поиска (снимки выдачи, подбор,
-        диагностика) и карточки, открытые из выдачи (подбор, HTTP get_card).
+      * сессия выдачи  — главная, страницы поиска (снимки выдачи, диагностика)
+        и карточки HTTP get_card.
     Сессия обхода никогда не открывает страницу поиска: вердикт антибота,
     полученный на выдаче, остаётся в сессии выдачи.
     Вызовы выполняются по очереди под общей блокировкой;
+  - подбор (select_for_stratum) — всегда новый браузер с временным профилем на
+    каждую страницу выдачи и каждую карточку, через repository (как до 13.10:
+    в долгоживущей сессии переход «выдача → карточка» стабильно давал капчу);
   - use_session=False (только диагностика): новый браузер на каждый вызов
     через repository.
 
@@ -133,12 +136,12 @@ class OzonService:
         return files
 
     # ================= Источник страниц: новый браузер или сессия ================= #
-    def _fetch_raw(self, url: str, full_content: bool = False) -> dict:
+    def _fetch_raw(self, url: str, full_content: bool = False, fresh: bool = False) -> dict:
         """Сырьё карточки/страницы {html, nuxt_state, screenshot_png, url, not_found}.
-        В режиме сессии - через долгоживущий браузер сессии выдачи (подбор, HTTP):
-        карточки здесь открываются из выдачи. При антиботе сессия закрывается.
+        fresh или режим без сессии — новый браузер с временным профилем (repository).
+        Иначе — долгоживущий браузер сессии выдачи (HTTP); при антиботе сессия закрывается.
         OutOfStockError и AntibotBlockedError пробрасываются."""
-        if not self.use_session:
+        if fresh or not self.use_session:
             return self.repo.fetch_raw(url, full_content=full_content)
         url = (url or "").strip()
         if not url:
@@ -182,24 +185,28 @@ class OzonService:
                 "current_page": current_page, "total_pages": total_pages,
                 "screenshot_png": parser.screenshot_png()}
 
-    def _fetch_listing(self, query: str | None = None, url: str | None = None) -> dict:
-        """Страница выдачи для подбора и диагностики (без прокрутки)."""
-        if not self.use_session:
+    def _fetch_listing(self, query: str | None = None, url: str | None = None,
+                       fresh: bool = False) -> dict:
+        """Страница выдачи для подбора и диагностики (без прокрутки).
+        fresh или режим без сессии — новый браузер с временным профилем (repository)."""
+        if fresh or not self.use_session:
             return self.repo.fetch_search_raw(query=query, url=url)
         page_url = url or OzonRepository.search_url_from_query(query)
         return self._listing_in_session(page_url, scroll_steps=0)
 
     # ------------------------------------------------------------------ #
-    def get_card(self, url: str, full_content: bool = True) -> dict:
+    def get_card(self, url: str, full_content: bool = True, fresh: bool = False) -> dict:
         """Полный разбор: вернуть структурированную карточку + debug-файлы.
-        full_content — дождаться полного блока характеристик (подбор и HTTP)."""
+        full_content — дождаться полного блока характеристик (подбор и HTTP).
+        fresh — новый браузер с временным профилем (подбор)."""
         t0 = time.monotonic()
-        logger.info("get_card: старт, url=%s (сессия=%s)", url, self.use_session)
+        logger.info("get_card: старт, url=%s (сессия=%s, новый браузер=%s)",
+                    url, self.use_session, fresh)
         with self._lock:
             try:
-                raw = self._fetch_raw(url, full_content=full_content)
+                raw = self._fetch_raw(url, full_content=full_content, fresh=fresh)
             except OutOfStockError:
-                if not self.use_session:
+                if fresh or not self.use_session:
                     raise
                 # Товар закончился (Ozon увёл на поиск) - не бан, карточка с нашим sku
                 card = OzonCard(
@@ -601,8 +608,9 @@ class OzonService:
     def select_for_stratum(self, req) -> dict:
         """
         Подбор карточек под страту. Категорийная логика — в стратегии
-        (app/categories), оркестрация — в selection.select_cards,
-        карточки берутся get_card (тот же путь, что card/by-url).
+        (app/categories), оркестрация — в selection.select_cards.
+        Каждая страница выдачи и каждая карточка — новый браузер с временным
+        профилем (fresh=True); долгоживущие сессии подбор не трогает.
         """
         from app.categories.registry import get_strategy
 
@@ -621,11 +629,12 @@ class OzonService:
         def fetch_page(url):
             # первая страница — по query (url=None), следующие — по nextPage
             pacer.wait()
-            return self._fetch_listing(query=req.query if url is None else None, url=url)
+            return self._fetch_listing(query=req.query if url is None else None, url=url,
+                                       fresh=True)
 
         def get_card_only(card_url):
             pacer.wait()
-            res = self.get_card(card_url)
+            res = self.get_card(card_url, fresh=True)
             return OzonCard(**res["card"])
 
         with self._lock:

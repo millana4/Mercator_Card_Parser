@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""Пауза между переходами внутри задачи подбора (одна сессия браузера на все задачи)."""
+"""Пауза между переходами внутри задачи подбора (каждая страница — новый браузер)."""
 import app.marketplaces.ozon.service as service_module
 from app.categories.models import StratumRequest
 from app.marketplaces.ozon.service import NavigationPacer, OzonService
@@ -27,12 +27,12 @@ def test_select_pauses_between_navigations(monkeypatch):
     service._sleep = sleeps.append
     navigations = []
 
-    def fake_fetch_listing(query=None, url=None):
-        navigations.append(("page", query, url))
+    def fake_fetch_listing(query=None, url=None, fresh=False):
+        navigations.append(("page", query, url, fresh))
         return {"html": "", "url": "u"}
 
-    def fake_get_card(card_url, full_content=True):
-        navigations.append(("card", card_url))
+    def fake_get_card(card_url, full_content=True, fresh=False):
+        navigations.append(("card", card_url, fresh))
         return {"card": {"sku": card_url}}
 
     def fake_select_cards(req, fetch_page, get_card, **kwargs):
@@ -50,7 +50,8 @@ def test_select_pauses_between_navigations(monkeypatch):
                          base_share=None, exclude=[], category="kids_clothing")
     service.select_for_stratum(req)
 
-    assert navigations == [("page", "лонгслив", None), ("card", "a"), ("card", "b")]
+    # подбор — новым браузером на каждую страницу (fresh=True)
+    assert navigations == [("page", "лонгслив", None, True), ("card", "a", True), ("card", "b", True)]
     assert len(sleeps) == 2
     lo, hi = service.policy.between_cards_min, service.policy.between_cards_max
     assert all(lo <= d <= hi for d in sleeps)

@@ -8,18 +8,23 @@ consumer.py — цикл потребления задач из Redis.
 любой свободный воркер берёт следующую задачу, воркер на паузе после бана
 задачи не тянет — их разбирают остальные.
 
-Задачи идут в двух долгоживущих сессиях браузера (см. OzonService):
-обход — в сессии обхода, снимки выдачи и подбор — в сессии выдачи.
-Реакция на блокировку:
+Браузеры (см. OzonService): обход — в долгоживущей сессии обхода, снимки
+выдачи — в долгоживущей сессии выдачи, подбор — новым браузером на каждую страницу.
+
+Две независимые полосы с паузами после бана:
+  - полоса обхода (parse): бан останавливает весь воркер — IP помечен на карточках;
+  - полоса выдачи и подбора (search, select): бан останавливает только выдачу
+    и подбор, обход продолжается — воркер слушает только очередь обхода.
+Реакция на блокировку в полосе:
   - капча/блок (ban) — сразу бан;
   - сбой загрузки (load) — браузер пересоздаётся; load_failure_threshold
-    сбоев подряд — бан;
+    сбоев подряд в полосе — бан;
   - бан: пауза ban_pause_start_s × 2^(уровень−1), не больше ban_pause_max_s;
-    уровень обнуляется после ban_level_reset_s без бана. Сбрасываются профиль
-    и устройство той сессии, где пойман бан; другая сессия не трогается.
-  - пробная задача после паузы берётся только из очереди обхода: выдача
-    и подбор — со следующей задачи.
-Уровень, пауза и поколения устройств хранятся только в памяти процесса:
+    уровень полосы обнуляется после ban_level_reset_s без бана. У выдачи и обхода
+    сбрасываются профиль и устройство своей сессии; у подбора сбрасывать нечего.
+  - после паузы обхода первая задача — пробная, только из очереди обхода.
+Устаревшие задачи выдачи (expired) не идут на Ozon: без счётчиков, учёта и паузы.
+Уровни, паузы и поколения устройств хранятся только в памяти процесса:
 перезапуск воркера их обнуляет (баны редкие, решаются ротацией IP).
 
 Подключение к Redis отказоустойчивое: ждёт Redis и переживает его падения.
@@ -28,6 +33,7 @@ import json
 import time
 import signal
 import random
+from dataclasses import dataclass
 
 import redis
 
@@ -40,20 +46,31 @@ from app.worker.handlers import handle_select, handle_parse, handle_search
 
 logger = get_logger(__name__)
 
-# Поток задачи -> сессия браузера, в которой она выполняется.
-SESSION_BY_STREAM = {"parse": CRAWL, "search": SEARCH, "select": SEARCH}
+# Поток задачи -> полоса пауз: обход отдельно, выдача и подбор вместе.
+LANE_BY_STREAM = {"parse": CRAWL, "search": SEARCH, "select": SEARCH}
+# Поток задачи -> долгоживущая сессия, у которой при бане сбрасываются профиль и
+# устройство. Подбор идёт новыми браузерами с временным профилем — сбрасывать нечего.
+SESSION_BY_STREAM = {"parse": CRAWL, "search": SEARCH, "select": None}
+LANE_TITLE = {CRAWL: "обход", SEARCH: "выдача и подбор"}
+
+
+@dataclass
+class LaneState:
+    """Состояние полосы: уровень бана, конец паузы, сбоев загрузки подряд."""
+    level: int = 0
+    until: float = 0.0
+    load_failures: int = 0
 
 
 class TaskConsumer:
     def __init__(self):
-        # Две долгоживущие сессии браузера: обход и выдача (снимки, подбор).
+        # Две долгоживущие сессии браузера: обход и выдача; подбор — новыми браузерами.
         self.service = OzonService(use_session=True)
         self.producer = ResultProducer()
         self.redis = None               # подключим в run(), с повторами
         self._running = True
-        self._load_failures = 0         # сбоев загрузки подряд
-        self._banned_until = 0.0        # конец текущей паузы после бана (epoch, сек)
-        self._ban_level = 0             # уровень бана: какой бан подряд (0 — банов не было)
+        self._lanes = {CRAWL: LaneState(), SEARCH: LaneState()}
+        self._search_paused = False     # выдача и подбор на паузе — слушаем только обход
         self._probe_pending = False     # следующая задача — пробная, только из очереди обхода
         # Поколение устройства по сессиям: растёт при бане своей сессии.
         self._generations = {CRAWL: 0, SEARCH: 0}
@@ -114,16 +131,18 @@ class TaskConsumer:
         self._shutdown()
 
     def _consume_loop(self):
-        """Внутренний цикл: BRPOP по всем ключам задач, пока нас не остановили."""
+        """Внутренний цикл: BRPOP по ключам задач, пока нас не остановили."""
         while self._running:
             if self.redis is None:
                 return
             if self._wait_ban_pause():
-                continue  # пауза после бана отсижена — проверяем флаг и берём пробную задачу
+                continue  # пауза обхода отсижена — проверяем флаг и берём пробную задачу
             # BRPOP блокируется до задачи или таймаута; таймаут → проверяем _running.
             # Список ключей: Redis отдаёт из первого непустого (приоритет select).
-            # Пробная задача после паузы — только из очереди обхода.
-            keys = rws.parse_task_keys if self._probe_pending else rws.task_keys
+            # Только очередь обхода: пробная задача после паузы обхода или
+            # выдача и подбор на паузе.
+            parse_only = self._probe_pending or self._search_lane_paused()
+            keys = rws.parse_task_keys if parse_only else rws.task_keys
             popped = self.redis.brpop(keys, timeout=rws.brpop_timeout_s)
             if popped is None:
                 continue  # таймаут — задач нет, проверяем флаг и ждём дальше
@@ -169,6 +188,10 @@ class TaskConsumer:
             logger.error("Результат не отправлен | task_id=%s — ядро переотправит по таймауту",
                          result.get("task_id"))
 
+        # Устаревшая задача выдачи: на Ozon не ходили — без счётчиков, учёта и паузы.
+        if failure == "expired":
+            return
+
         # Счётчики наблюдаемости — свои на каждую площадку; у снимков выдачи — отдельные.
         if failure == "load":
             self.producer.incr_counter(rws.counter_load_failed(marketplace))
@@ -180,63 +203,81 @@ class TaskConsumer:
         else:
             self.producer.incr_counter(rws.counter_done(marketplace))
 
-        # Пауза общая на воркер; профиль и устройство сбрасываются у сессии задачи.
-        self._track_failure(failure, SESSION_BY_STREAM.get(stream, CRAWL))
-        if time.time() < self._banned_until:
-            return  # пауза после бана — в начале следующей итерации цикла
+        # Пауза — в полосе задачи; профиль и устройство — у сессии задачи.
+        self._track_failure(failure, stream)
+        if time.time() < self._lanes[CRAWL].until:
+            return  # пауза обхода — в начале следующей итерации цикла
         self._pause_between_cards()
 
     # ------------------------------------------------------------------ #
-    def _track_failure(self, failure: str | None, session: str) -> None:
-        """Учёт блокировок: ban — сразу бан; load — бан после серии сбоев подряд;
-        любой другой исход (страница загрузилась) обнуляет серию сбоев.
-        session — сессия браузера задачи: у неё сбрасываются профиль и устройство."""
+    def _track_failure(self, failure: str | None, stream: str) -> None:
+        """Учёт блокировок в полосе потока: ban — сразу бан; load — бан после серии
+        сбоев подряд; любой другой исход (страница загрузилась) обнуляет серию."""
+        lane = LANE_BY_STREAM.get(stream, CRAWL)
+        state = self._lanes[lane]
         if failure == "ban":
-            self._register_ban("капча или блокировка", session)
+            self._register_ban(lane, stream, "капча или блокировка")
         elif failure == "load":
-            self._load_failures += 1
+            state.load_failures += 1
             threshold = self._policy.load_failure_threshold
-            logger.warning("Сбой загрузки подряд: %s/%s", self._load_failures, threshold)
-            if self._load_failures >= threshold:
-                self._register_ban(f"сбоев загрузки подряд: {self._load_failures}", session)
+            logger.warning("Сбой загрузки подряд (%s): %s/%s",
+                           LANE_TITLE[lane], state.load_failures, threshold)
+            if state.load_failures >= threshold:
+                self._register_ban(lane, stream, f"сбоев загрузки подряд: {state.load_failures}")
         else:
-            self._load_failures = 0
+            state.load_failures = 0
 
-    def _register_ban(self, reason: str, session: str) -> None:
-        """Бан: рассчитать уровень и паузу, перейти на следующее устройство
-        в сессии бана, сбросить профиль этой сессии. Пауза общая на воркер —
-        в _wait_ban_pause. Уровень растёт, если с конца прошлой паузы прошло
+    def _register_ban(self, lane: str, stream: str, reason: str) -> None:
+        """Бан в полосе: уровень и пауза полосы; у сессии потока — новое устройство
+        и сброс профиля. Уровень растёт, если с конца прошлой паузы полосы прошло
         меньше ban_level_reset_s, иначе снова 1."""
+        state = self._lanes[lane]
         now = time.time()
-        level = next_ban_level(self._ban_level, self._banned_until, now,
-                               self._policy.ban_level_reset_s)
+        level = next_ban_level(state.level, state.until, now, self._policy.ban_level_reset_s)
         pause = ban_pause_s(level, self._policy.ban_pause_start_s, self._policy.ban_pause_max_s)
-        self._ban_level = level
-        self._banned_until = now + pause
-        self._load_failures = 0
-        self._generations[session] += 1
+        state.level = level
+        state.until = now + pause
+        state.load_failures = 0
+        until_text = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(state.until))
+        if lane == CRAWL:
+            logger.warning("БАН обхода (%s, поток %s): уровень %s, пауза %.0f мин до %s — "
+                           "весь воркер на паузе", reason, stream, level, pause / 60, until_text)
+        else:
+            self._search_paused = True
+            logger.warning("БАН выдачи и подбора (%s, поток %s): уровень %s, пауза %.0f мин до %s — "
+                           "обход продолжается", reason, stream, level, pause / 60, until_text)
 
-        logger.warning("БАН (%s, сессия %s): уровень %s, пауза %.0f мин до %s — новое устройство "
-                       "(поколение %s), сбрасываю профиль сессии",
-                       reason, session, level, pause / 60,
-                       time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(self._banned_until)),
-                       self._generations[session])
+        session = SESSION_BY_STREAM.get(stream)
+        if session is None:
+            return  # подбор: новые браузеры с временным профилем — сбрасывать нечего
+        self._generations[session] += 1
+        logger.warning("Новое устройство сессии %s (поколение %s), сбрасываю её профиль",
+                       session, self._generations[session])
         try:
             self.service.set_device_generation(self._generations[session], session)
             self.service.reset_profile(session)
         except Exception as e:
             logger.warning("Ошибка смены устройства или сброса профиля браузера: %s", e)
 
+    def _search_lane_paused(self) -> bool:
+        """Выдача и подбор на паузе? При окончании паузы — одна запись в лог."""
+        if time.time() < self._lanes[SEARCH].until:
+            return True
+        if self._search_paused:
+            self._search_paused = False
+            logger.info("Пауза выдачи и подбора окончена — снова беру все задачи")
+        return False
+
     def _wait_ban_pause(self) -> bool:
-        """Если идёт пауза после бана — отсидеть её (прерываемо). True, если ждали."""
-        remaining = self._banned_until - time.time()
+        """Если идёт пауза обхода — отсидеть её (прерываемо). True, если ждали."""
+        remaining = self._lanes[CRAWL].until - time.time()
         if remaining <= 0:
             return False
-        logger.warning("Пауза после бана: %.0f мин — задачи не беру", remaining / 60)
+        logger.warning("Пауза после бана обхода: %.0f мин — задачи не беру", remaining / 60)
         self._interruptible_sleep(remaining)
         if self._running:
             self._probe_pending = True
-            logger.info("Пауза после бана окончена — следующая задача пробная (из очереди обхода)")
+            logger.info("Пауза обхода окончена — следующая задача пробная (из очереди обхода)")
         return True
 
     def _pause_between_cards(self) -> None:

@@ -45,14 +45,15 @@ class OzonRepository:
         """
         Открыть карточку и вернуть сырьё:
           {html, nuxt_state, screenshot_png}.
-        Парсер создаётся и закрывается на каждый вызов (Selenium не разделяется).
+        Парсер создаётся и закрывается на каждый вызов (Selenium не разделяется),
+        профиль временный: постоянные профили заняты долгоживущими сессиями воркера.
         """
         url = url.strip()
         if not url:
             raise InvalidRequestError("Пустой URL", marketplace="ozon")
 
         logger.debug("OzonRepository.fetch_raw: url=%s", url)
-        parser = OzonParser(self.policy)
+        parser = OzonParser(self.policy, profile_dir="")   # временный профиль
         try:
             html = parser.fetch_html(url, full_content=full_content)
             not_found = ('data-widget="error"' in html
@@ -87,7 +88,7 @@ class OzonRepository:
         """
         page_url = url or self.search_url_from_query(query)
         logger.debug("OzonRepository.fetch_search_raw: url=%s", page_url)
-        parser = OzonParser(self.policy)
+        parser = OzonParser(self.policy, profile_dir="")   # временный профиль
         try:
             html = parser.fetch_listing_html(page_url)
             nuxt = {}
