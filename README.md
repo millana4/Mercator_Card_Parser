@@ -250,6 +250,39 @@ docker compose run --rm worker python -m utils.fp_check | grep -E "FAIL|ИТОГ
 docker compose up -d
 ```
 
+Скрипт, чтобы обновить .env из env.example:
+```bash
+git pull --ff-only
+(
+set -e
+backup=~/env_backup_$(basename "$PWD")_$(date +%Y%m%d_%H%M%S)
+cp .env "$backup"
+awk '
+  /^[A-Za-z_][A-Za-z0-9_]*=/ { split($0, p, "="); key = p[1] }
+  NR == FNR {
+    if ($0 ~ /^[A-Za-z_][A-Za-z0-9_]*=/) { if (!(key in env)) order[++n] = key; env[key] = $0 }
+    next
+  }
+  /^[A-Za-z_][A-Za-z0-9_]*=/ {
+    if (key in env) { print env[key]; used[key] = 1 }
+    else { print; print "добавлено: " key > "/dev/stderr" }
+    next
+  }
+  { print }
+  END {
+    head = 0
+    for (i = 1; i <= n; i++) if (!(order[i] in used)) {
+      if (!head) { print ""; print "# --- Есть только на этой машине (нет в .env.example)"; head = 1 }
+      print env[order[i]]
+      print "нет в .env.example: " order[i] > "/dev/stderr"
+    }
+  }
+' .env .env.example > .env.new
+cat .env.new > .env && rm .env.new
+echo "Копия прежнего .env: $backup"
+)
+```
+
 ## Тесты
 
 ```bash
