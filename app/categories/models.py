@@ -28,6 +28,12 @@ class ExcludedCard(BaseModel):
     )
 
 
+class PrioritySku(BaseModel):
+    """SKU, часто встречавшийся в поисковой выдаче страты (список от ядра)."""
+    sku: str = Field(..., description="Артикул")
+    count: int = Field(0, description="В скольких прогонах выдачи встретился за окно")
+
+
 class StratumRequest(BaseModel):
     """Одна страта на вход эндпоинта подбора."""
     query: str = Field(..., description="Поисковый запрос (что писать в поиск Ozon)")
@@ -44,6 +50,11 @@ class StratumRequest(BaseModel):
         "clothing",
         description="Категория товаров: определяет логику подбора "
                     "(clothing, kids_clothing, ...)",
+    )
+    priority_skus: list[PrioritySku] = Field(
+        default_factory=list,
+        description="Частые SKU поисковой выдачи страты по убыванию частоты: "
+                    "среди прошедших первичный отсев на странице проверяются первыми",
     )
 
 

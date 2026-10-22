@@ -17,12 +17,12 @@ from datetime import date
 
 from app.categories.clothing import ClothingStrategy
 from app.categories.kids_clothing import KidsClothingStrategy
-from app.categories.models import Collection, ExcludedCard, StratumRequest
+from app.categories.models import Collection, ExcludedCard, StratumRequest, PrioritySku
 from app.categories.registry import get_strategy, known_categories
 from app.marketplaces.ozon.search_listing import (
     extract_candidates, extract_next_page, prefilter, dedupe, passes_quality,
 )
-from app.marketplaces.ozon.selection import seller_is_free, select_cards
+from app.marketplaces.ozon.selection import seller_is_free, select_cards, prioritize
 
 FIXTURE = os.path.join(os.path.dirname(__file__), "fixtures",
                        "ozon_search_trusy_zhenskie.html")
@@ -449,3 +449,82 @@ def test_select_kids_takes_school_collection():
                          base_share=1.0, category="kids_clothing")
     r = select_cards(req, _page_once(html), get_card, 4.8, 100, 3, date(2026, 7, 1))
     assert r["found"] == 2
+
+
+
+
+# =================================================================== #
+#  Приоритет частых SKU поисковой выдачи                               #
+# =================================================================== #
+class _Cand:
+    """Минимальный кандидат выдачи: только sku."""
+
+    def __init__(self, sku):
+        self.sku = sku
+
+
+def test_prioritize_moves_frequent_first():
+    cands = [_Cand("1"), _Cand("2"), _Cand("3"), _Cand("4")]
+    pr = [PrioritySku(sku="3", count=7), PrioritySku(sku="9", count=6),
+          PrioritySku(sku="1", count=2)]
+    # частые — в порядке списка, остальные — в прежнем порядке
+    assert [c.sku for c in prioritize(cands, pr)] == ["3", "1", "2", "4"]
+
+
+def test_prioritize_empty_keeps_order():
+    cands = [_Cand("1"), _Cand("2")]
+    assert prioritize(cands, []) is cands
+
+
+def test_select_checks_priority_skus_first():
+    """Частые SKU с конца страницы проверяются и берутся первыми."""
+    import re
+    html = _html()
+    order = [c.sku for c in prefilter(extract_candidates(html), [], 4.8, 100)]
+    assert len(order) >= 3
+    top, second = order[-1], order[-2]
+    visited = []
+
+    def get_card(url):
+        sku = re.search(r"-(\d+)/?$", url).group(1)
+        visited.append(sku)
+        return _Card(sku, "seller_" + sku)
+
+    req = StratumRequest(query="Трусы", count=2, is_seasonal=False,
+                         priority_skus=[PrioritySku(sku=top, count=7),
+                                        PrioritySku(sku=second, count=5)])
+    r = select_cards(req, _page_once(html), get_card, 4.8, 100, 3, date(2026, 7, 1))
+    assert [c.sku for c in r["cards"]] == [top, second]
+    assert visited == [top, second]
+
+
+def test_select_priority_not_on_page_keeps_order():
+    """Частых SKU нет на странице — порядок как без списка."""
+    import re
+    html = _html()
+    order = [c.sku for c in prefilter(extract_candidates(html), [], 4.8, 100)]
+    visited = []
+
+    def get_card(url):
+        sku = re.search(r"-(\d+)/?$", url).group(1)
+        visited.append(sku)
+        return _Card(sku, "seller_" + sku)
+
+    req = StratumRequest(query="Трусы", count=2, is_seasonal=False,
+                         priority_skus=[PrioritySku(sku="999999999", count=7)])
+    select_cards(req, _page_once(html), get_card, 4.8, 100, 3, date(2026, 7, 1))
+    assert visited == order[:2]
+
+
+def test_build_request_reads_priority_skus():
+    """Обработчик задачи: priority_skus из Redis, пустые и битые элементы пропускаются."""
+    from app.worker.handlers import _build_stratum_request
+    base = {"query": "Трусы", "count": 2}
+
+    req = _build_stratum_request({**base, "priority_skus": [
+        {"sku": "111", "count": 7}, {"sku": None, "count": 3}, {"count": 2},
+        "мусор", {"sku": 222, "count": 1}]})
+    assert [(p.sku, p.count) for p in req.priority_skus] == [("111", 7), ("222", 1)]
+
+    assert _build_stratum_request({**base, "priority_skus": None}).priority_skus == []
+    assert _build_stratum_request(base).priority_skus == []

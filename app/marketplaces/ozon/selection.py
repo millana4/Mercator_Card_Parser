@@ -6,13 +6,18 @@ selection.py — оркестрация подбора карточек под �
 живёт в app/categories/. Здесь остаётся то, что одинаково для всех
 категорий: листание выдачи, первичный отсев, заход в карточку, учёт слотов.
 
-Модели контракта (StratumRequest, ExcludedCard, Collection, Need) переехали
-в app/categories/models.py и реэкспортируются отсюда для совместимости.
+Приоритет частых SKU: ядро передаёт priority_skus — SKU, часто встречавшиеся
+в поисковой выдаче страты (по убыванию частоты). На каждой странице после
+первичного отсева такие кандидаты проверяются первыми; остальные — в прежнем
+порядке. Число заходов в карточки не меняется.
+
+Модели контракта (StratumRequest, ExcludedCard, PrioritySku, Collection, Need)
+переехали в app/categories/models.py и реэкспортируются отсюда для совместимости.
 """
 import re
 
 from app.categories.base import CategoryStrategy
-from app.categories.models import Collection, ExcludedCard, Need, StratumRequest
+from app.categories.models import Collection, ExcludedCard, Need, PrioritySku, StratumRequest
 from app.categories.registry import get_strategy
 from app.core.exceptions import AntibotBlockedError
 from app.core.logging import get_logger
@@ -22,8 +27,8 @@ logger = get_logger(__name__)
 
 # Реэкспорт: внешний код и тесты продолжают импортировать эти имена из selection.
 __all__ = [
-    "Collection", "ExcludedCard", "StratumRequest", "Need",
-    "select_cards", "seller_is_free",
+    "Collection", "ExcludedCard", "PrioritySku", "StratumRequest", "Need",
+    "select_cards", "seller_is_free", "prioritize",
 ]
 
 
@@ -44,6 +49,21 @@ def seller_is_free(seller_id: str | None, taken_seller_ids: set[str],
         return False
     logger.info("%sмагазин %s свободен -> подходит", tag, seller_id)
     return True
+
+
+def prioritize(cands: list, priority: list[PrioritySku]) -> list:
+    """
+    Кандидаты из списка частых SKU — первыми, в порядке списка (по убыванию
+    частоты); остальные — в прежнем порядке (сортировка устойчивая).
+    Пустой список — порядок не меняется.
+    """
+    if not priority:
+        return cands
+    rank: dict[str, int] = {}
+    for i, p in enumerate(priority):
+        rank.setdefault(str(p.sku), i)
+    tail = len(rank)
+    return sorted(cands, key=lambda c: rank.get(str(c.sku), tail))
 
 
 def _reviews_to_int(value) -> int | None:
@@ -81,14 +101,22 @@ def select_cards(
     (см. service.select_for_stratum).
 
     Ленивая пагинация: следующая страница берётся, только если не хватило.
+    Частые SKU выдачи (req.priority_skus) на каждой странице проверяются первыми.
     """
     strategy = strategy or get_strategy(req.category)
 
+    # Частота SKU в выдаче — для порядка кандидатов и лога.
+    freq: dict[str, int] = {}
+    for p in req.priority_skus:
+        freq.setdefault(str(p.sku), p.count)
+
     need = strategy.compute_need(req, today)
     logger.info("=== ПОДБОР СТАРТ | категория=%s | query=%r | нужно всего=%s "
-                "(base=%s, season=%s, сезон=%s) | пороги: рейтинг>=%s, отзывы>%s ===",
+                "(base=%s, season=%s, сезон=%s) | пороги: рейтинг>=%s, отзывы>%s | "
+                "частых в выдаче=%s ===",
                 strategy.name, req.query, need.total, need.base, need.seasonal,
-                need.season.value if need.season else "нет", min_rating, min_reviews)
+                need.season.value if need.season else "нет", min_rating, min_reviews,
+                len(freq))
 
     if need.total == 0:
         logger.info("Подбор не требуется: потребность 0")
@@ -106,6 +134,7 @@ def select_cards(
     picked: list = []
     got_base = 0
     got_season = 0
+    got_priority = 0
     page_url = None                   # первая страница — по query
 
     for page_no in range(1, max_pages + 1):
@@ -119,6 +148,12 @@ def select_cards(
         logger.info("Страница %s: после первичного отсева=%s "
                     "(рейтинг>=%s, отзывы>%s, дедуп, исключения)",
                     page_no, len(pf), min_rating, min_reviews)
+
+        if freq:
+            pf = prioritize(pf, req.priority_skus)
+            on_page = sum(1 for c in pf if str(c.sku) in freq)
+            logger.info("Страница %s: частых в выдаче среди кандидатов=%s — проверяю их первыми",
+                        page_no, on_page)
 
         for c in pf:
             if strategy.slots_full(need, got_base, got_season):
@@ -165,8 +200,15 @@ def select_cards(
             else:
                 got_base += 1
 
-            logger.info("ВЗЯТА sku=%s в слот %s | магазин=%s | season %s/%s, base %s/%s",
-                        c.sku, slot, seller_id, got_season, need.seasonal,
+            frequent = freq.get(str(c.sku))
+            if frequent is not None:
+                got_priority += 1
+
+            logger.info("ВЗЯТА sku=%s в слот %s | магазин=%s | частая в выдаче: %s | "
+                        "season %s/%s, base %s/%s",
+                        c.sku, slot, seller_id,
+                        frequent if frequent is not None else "нет",
+                        got_season, need.seasonal,
                         got_base, need.base if need.season else need.total)
 
         if strategy.slots_full(need, got_base, got_season):
@@ -202,8 +244,10 @@ def select_cards(
         logger.info("Достигнут потолок страниц (%s)", max_pages)
 
     found = len(picked)
-    logger.info("=== ПОДБОР ЗАВЕРШЁН | категория=%s | набрано %s из %s%s ===",
+    logger.info("=== ПОДБОР ЗАВЕРШЁН | категория=%s | набрано %s из %s%s | "
+                "из них частых в выдаче %s ===",
                 strategy.name, found, need.total,
-                " (меньше нужного — штатный исход)" if found < need.total else "")
+                " (меньше нужного — штатный исход)" if found < need.total else "",
+                got_priority)
 
     return {"cards": picked, "requested": req.count, "found": found}

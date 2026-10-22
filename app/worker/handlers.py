@@ -16,7 +16,7 @@ from app.core.config import settings
 from app.core.exceptions import (AntibotBlockedError, InvalidRequestError,
                                  PageLoadError, ProductNotFoundError)
 from app.marketplaces.ozon.service import OzonService
-from app.marketplaces.ozon.selection import StratumRequest, ExcludedCard
+from app.marketplaces.ozon.selection import StratumRequest, ExcludedCard, PrioritySku
 
 logger = get_logger(__name__)
 
@@ -30,9 +30,10 @@ def handle_select(task: dict, service: OzonService) -> dict:
         "marketplace": task.get("marketplace"),
     }
     logger.info("SELECT задача | task_id=%s set_id=%s stratum_id=%s "
-                "категория=%s query=%r count=%s",
+                "категория=%s query=%r count=%s частых в выдаче=%s",
                 echo["task_id"], echo["set_id"], echo["stratum_id"],
-                task.get("category"), task.get("query"), task.get("count"))
+                task.get("category"), task.get("query"), task.get("count"),
+                len(task.get("priority_skus") or []))
     try:
         req = _build_stratum_request(task)
         result = service.select_for_stratum(req)
@@ -135,6 +136,14 @@ def _build_stratum_request(task: dict) -> StratumRequest:
             seller=e.get("seller"),          # ← поле seller (см. правку в selection.py)
             collection=e.get("collection"),
         ))
+    # Частые SKU выдачи страты (от ядра, по убыванию частоты). Нет поля или null
+    # (ниши, старое ядро) — пустой список; элементы без sku пропускаются.
+    priority = []
+    for p in (task.get("priority_skus") or []):
+        sku = p.get("sku") if isinstance(p, dict) else None
+        if sku is None or str(sku) == "":
+            continue
+        priority.append(PrioritySku(sku=str(sku), count=int(p.get("count") or 0)))
     return StratumRequest(
         query=task["query"],
         count=task["count"],
@@ -142,6 +151,7 @@ def _build_stratum_request(task: dict) -> StratumRequest:
         base_share=task.get("base_share"),
         exclude=exclude,
         category=task.get("category") or "clothing",
+        priority_skus=priority,
     )
 
 
