@@ -10,6 +10,9 @@ parse:tasks:ozon:spb. Маркетплейс разводит площадки, 
 Детский мир. Список задаётся через запятую, порядок = приоритет.
 
 parser_id — идентификатор воркера для наблюдаемости (логи ядра + счётчики).
+
+Роль reserve: воркер берёт только задачи обхода и только пока ядро держит
+ключ-сигнал резерва <prefix>:<marketplace>:<geo> (обход отстаёт от графика).
 """
 from pydantic import Field, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -32,7 +35,8 @@ class RedisWorkerSettings(BaseSettings):
     # "ozon" | "ozon,detmir" — порядок задаёт приоритет при выборе задачи.
     marketplaces_raw: str = Field(default="ozon", alias="PARSER_MARKETPLACES")
 
-    # Роль парсера: primary — быстрый темп; reserve — щадящий (1 обход/сут).
+    # Роль парсера: primary — берёт все задачи; reserve — только задачи обхода
+    # и только пока стоит сигнал резерва от ядра, в щадящем темпе.
     role: str = Field(default="primary", alias="PARSER_ROLE")
 
     # Идентификатор воркера для наблюдаемости (в результатах и счётчиках).
@@ -50,6 +54,8 @@ class RedisWorkerSettings(BaseSettings):
     select_results_prefix: str = Field(default="select:results", alias="REDIS_SELECT_RESULTS_PREFIX")
     search_tasks_prefix: str = Field(default="search:tasks", alias="REDIS_SEARCH_TASKS_PREFIX")
     search_results_prefix: str = Field(default="search:results", alias="REDIS_SEARCH_RESULTS_PREFIX")
+    # Ключ-сигнал резерва (ставит ядро, пока обход отстаёт): <prefix>:<marketplace>:<geo>.
+    reserve_signal_prefix: str = Field(default="monitoring:reserve", alias="REDIS_RESERVE_SIGNAL_PREFIX")
 
     @field_validator("marketplaces_raw")
     @classmethod
@@ -93,6 +99,14 @@ class RedisWorkerSettings(BaseSettings):
         search_keys = [self.search_tasks_key(m) for m in self.marketplaces]
         parse_keys = [self.parse_tasks_key(m) for m in self.marketplaces]
         return select_keys + search_keys + parse_keys
+
+    def reserve_signal_key(self, marketplace: str) -> str:
+        return f"{self.reserve_signal_prefix}:{marketplace}:{self.geo_code}"
+
+    @property
+    def is_reserve(self) -> bool:
+        """Резервный воркер: задачи обхода только по сигналу резерва."""
+        return self.role.strip().lower() == "reserve"
 
     @property
     def parse_task_keys(self) -> list[str]:

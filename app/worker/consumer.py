@@ -24,6 +24,10 @@ consumer.py — цикл потребления задач из Redis.
     сбрасываются профиль и устройство своей сессии; у подбора сбрасывать нечего.
   - после паузы обхода первая задача — пробная, только из очереди обхода.
 Устаревшие задачи выдачи (expired) не идут на Ozon: без счётчиков, учёта и паузы.
+
+Роль reserve (PARSER_ROLE=reserve): воркер запущен, но берёт задачи, только пока
+ядро держит ключ-сигнал резерва (обход отстаёт от графика), и только задачи
+обхода, в щадящем темпе. Без сигнала раз в RESERVE_POLL_S проверяет ключ.
 Уровни, паузы и поколения устройств хранятся только в памяти процесса:
 перезапуск воркера их обнуляет (баны редкие, решаются ротацией IP).
 
@@ -45,6 +49,8 @@ from app.worker.result_producer import ResultProducer
 from app.worker.handlers import handle_select, handle_parse, handle_search
 
 logger = get_logger(__name__)
+
+RESERVE_POLL_S = 30      # резерв без сигнала: как часто проверять ключ, сек
 
 # Поток задачи -> полоса пауз: обход отдельно, выдача и подбор вместе.
 LANE_BY_STREAM = {"parse": CRAWL, "search": SEARCH, "select": SEARCH}
@@ -71,6 +77,7 @@ class TaskConsumer:
         self._running = True
         self._lanes = {CRAWL: LaneState(), SEARCH: LaneState()}
         self._search_paused = False     # выдача и подбор на паузе — слушаем только обход
+        self._reserve_active = False    # резерв: сигнал ядра стоит, задачи обхода берём
         self._probe_pending = False     # следующая задача — пробная, только из очереди обхода
         # Поколение устройства по сессиям: растёт при бане своей сессии.
         self._generations = {CRAWL: 0, SEARCH: 0}
@@ -112,6 +119,10 @@ class TaskConsumer:
                     rws.geo_code, rws.geo_name, ", ".join(rws.marketplaces),
                     rws.role, rws.parser_id)
 
+        if rws.is_reserve:
+            logger.info("Резерв: беру только задачи обхода и только по сигналу ядра (%s)",
+                        ", ".join(rws.reserve_signal_key(m) for m in rws.marketplaces))
+
         while self._running:
             if self.redis is None:
                 self.redis = self._connect_redis()
@@ -137,11 +148,14 @@ class TaskConsumer:
                 return
             if self._wait_ban_pause():
                 continue  # пауза обхода отсижена — проверяем флаг и берём пробную задачу
+            if rws.is_reserve and not self._reserve_signal():
+                self._interruptible_sleep(RESERVE_POLL_S)
+                continue  # резерв без сигнала — задачи не берём
             # BRPOP блокируется до задачи или таймаута; таймаут → проверяем _running.
             # Список ключей: Redis отдаёт из первого непустого (приоритет select).
-            # Только очередь обхода: пробная задача после паузы обхода или
-            # выдача и подбор на паузе.
-            parse_only = self._probe_pending or self._search_lane_paused()
+            # Только очередь обхода: резерв, пробная задача после паузы обхода
+            # или выдача и подбор на паузе.
+            parse_only = rws.is_reserve or self._probe_pending or self._search_lane_paused()
             keys = rws.parse_task_keys if parse_only else rws.task_keys
             popped = self.redis.brpop(keys, timeout=rws.brpop_timeout_s)
             if popped is None:
@@ -258,6 +272,18 @@ class TaskConsumer:
             self.service.reset_profile(session)
         except Exception as e:
             logger.warning("Ошибка смены устройства или сброса профиля браузера: %s", e)
+
+    def _reserve_signal(self) -> bool:
+        """Резерв: стоит ли сигнал ядра хотя бы для одной площадки воркера.
+        Смена состояния — одна запись в лог."""
+        active = any(self.redis.exists(rws.reserve_signal_key(m)) for m in rws.marketplaces)
+        if active != self._reserve_active:
+            self._reserve_active = active
+            if active:
+                logger.warning("Резерв: сигнал ядра — обход отстаёт, беру задачи обхода")
+            else:
+                logger.info("Резерв: сигнала нет — задачи не беру, проверяю раз в %s с", RESERVE_POLL_S)
+        return active
 
     def _search_lane_paused(self) -> bool:
         """Выдача и подбор на паузе? При окончании паузы — одна запись в лог."""
