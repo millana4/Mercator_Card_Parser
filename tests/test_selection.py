@@ -5,7 +5,7 @@ test_selection.py — тесты подбора карточек под стра
 Работают БЕЗ сети: выдача берётся из сохранённого HTML (фикстура),
 заход в карточку и открытие страниц мокаются. Проверяют извлечение
 кандидатов, первичный отсев, расчёт потребности, сезонный фильтр,
-уникальность магазина и оркестратор набора с пагинацией.
+уникальность магазина и оркестратор набора с догрузками выдачи.
 
 Категорийная логика (сезоны, коллекции, пороги, уникальность продавца)
 живёт в стратегиях app/categories — они и тестируются напрямую.
@@ -15,12 +15,16 @@ test_selection.py — тесты подбора карточек под стра
 import os
 from datetime import date
 
+import pytest
+
 from app.categories.clothing import ClothingStrategy
 from app.categories.kids_clothing import KidsClothingStrategy
 from app.categories.models import Collection, ExcludedCard, StratumRequest, PrioritySku
 from app.categories.registry import get_strategy, known_categories
+from app.core.exceptions import AntibotBlockedError
 from app.marketplaces.ozon.search_listing import (
-    extract_candidates, extract_next_page, prefilter, dedupe, passes_quality,
+    candidates_from_tiles, extract_candidates, extract_next_page, parse_tile, prefilter,
+    dedupe, passes_quality,
 )
 from app.marketplaces.ozon.selection import seller_is_free, select_cards, prioritize
 
@@ -341,10 +345,11 @@ def test_need_kids_same_as_clothing():
 #  Оркестратор (на фикстуре выдачи + моках карточек)                  #
 # =================================================================== #
 def _page_once(html):
-    """fetch_page, отдающий одну страницу без следующей."""
-    def fetch(url):
-        return {"html": html, "url": url or "page1", "next_page": None}
-    return fetch
+    """load_candidates: кандидаты фикстуры одной догрузкой; следующая догрузка
+    новых артикулов не даёт - выдача кончилась."""
+    def load(known, want):
+        return [c for c in extract_candidates(html) if c.sku not in known]
+    return load
 
 
 def test_select_non_seasonal_picks_count():
@@ -375,25 +380,23 @@ def test_select_stops_when_enough():
     assert r["found"] == 2   # ровно 2, не больше
 
 
-def test_select_seller_dedup_needs_next_page():
+def test_select_seller_dedup_needs_next_load():
     html = _html()
 
-    # все карточки — один магазин: с одной страницы наберём максимум 1
+    # все карточки — один магазин: из выдачи наберём максимум 1
     def get_card(url):
         return _Card("x", "ONE_SHOP")
 
-    # fetch_page с одной следующей страницей (та же выдача), затем конец
     calls = {"n": 0}
 
-    def fetch(url):
+    def load(known, want):
         calls["n"] += 1
-        nxt = "page2" if calls["n"] == 1 else None
-        return {"html": html, "url": url or "page1", "next_page": nxt}
+        return [c for c in extract_candidates(html) if c.sku not in known]
 
     req = StratumRequest(query="Трусы", count=2, is_seasonal=False)
-    r = select_cards(req, fetch, get_card, 4.8, 100, 3, date(2026, 7, 1))
+    r = select_cards(req, load, get_card, 4.8, 100, 3, date(2026, 7, 1))
     assert r["found"] == 1          # больше одного магазина не набрать
-    assert calls["n"] == 2          # была попытка второй страницы
+    assert calls["n"] == 2          # была догрузка; новых плиток нет - выдача кончилась
 
 
 def test_select_kids_ignores_seller_dedup():
@@ -528,3 +531,95 @@ def test_build_request_reads_priority_skus():
 
     assert _build_stratum_request({**base, "priority_skus": None}).priority_skus == []
     assert _build_stratum_request(base).priority_skus == []
+
+
+
+
+# =================================================================== #
+#  Догрузки выдачи прокруткой и капча после набранного                 #
+# =================================================================== #
+def _sku_of(url):
+    import re
+    return re.search(r"-(\d+)/?$", url).group(1)
+
+
+def test_select_loads_more_when_short():
+    """Не хватило кандидатов первой догрузки — подбор догружает выдачу и берёт только новых."""
+    html = _html()
+    cands = extract_candidates(html)
+    order = [c.sku for c in prefilter(cands, [], 4.8, 100)]
+    assert len(order) >= 2
+    first = [c for c in cands if c.sku == order[0]]           # в первой догрузке один годный
+    rest = [c for c in cands if c.sku in order[1:]]
+    batches = [first, rest]
+    known_seen = []
+
+    def load(known, want):
+        known_seen.append(set(known))
+        return batches.pop(0) if batches else []
+
+    def get_card(url):
+        sku = _sku_of(url)
+        return _Card(sku, "seller_" + sku)
+
+    req = StratumRequest(query="Трусы", count=2, is_seasonal=False)
+    r = select_cards(req, load, get_card, 4.8, 100, 3, date(2026, 7, 1))
+    assert r["found"] == 2 and r["blocked"] is None
+    assert len(known_seen) == 2
+    assert known_seen[1] == {c.sku for c in first}             # вторая догрузка знает первую
+
+
+def test_select_want_uses_pool_multiplier():
+    """Первая догрузка просит max(min_pool, нужно × множитель) новых плиток."""
+    wants = []
+
+    def load(known, want):
+        wants.append(want)
+        return []
+
+    select_cards(StratumRequest(query="Трусы", count=20, is_seasonal=False),
+                 load, lambda url: None, 4.8, 100, 3, date(2026, 7, 1),
+                 pool_multiplier=3, min_pool=32)
+    select_cards(StratumRequest(query="Трусы", count=2, is_seasonal=False),
+                 load, lambda url: None, 4.8, 100, 3, date(2026, 7, 1),
+                 pool_multiplier=3, min_pool=32)
+    assert wants == [60, 32]
+
+
+def test_select_returns_partial_on_captcha():
+    """Капча после набранного: подбор останавливается и отдаёт набранное до капчи."""
+    html = _html()
+    calls = {"n": 0}
+
+    def get_card(url):
+        calls["n"] += 1
+        if calls["n"] == 2:
+            raise AntibotBlockedError("капча", marketplace="ozon")
+        sku = _sku_of(url)
+        return _Card(sku, "seller_" + sku)
+
+    req = StratumRequest(query="Трусы", count=3, is_seasonal=False)
+    r = select_cards(req, _page_once(html), get_card, 4.8, 100, 3, date(2026, 7, 1))
+    assert r["found"] == 1 and len(r["cards"]) == 1
+    assert isinstance(r["blocked"], AntibotBlockedError)
+    assert calls["n"] == 2                                     # после капчи никуда не ходит
+
+
+def test_select_raises_on_captcha_without_cards():
+    """Капча до первой набранной карточки — ошибка, как раньше."""
+    def get_card(url):
+        raise AntibotBlockedError("капча", marketplace="ozon")
+
+    req = StratumRequest(query="Трусы", count=2, is_seasonal=False)
+    with pytest.raises(AntibotBlockedError):
+        select_cards(req, _page_once(_html()), get_card, 4.8, 100, 3, date(2026, 7, 1))
+
+
+def test_candidates_from_rendered_tiles():
+    """Кандидаты из отрисованных плиток: артикул, ссылка, slug, рейтинг, отзывы, «Оригинал»."""
+    tile = parse_tile("/product/trusy-zhenskie-123/?at=x",
+                      ["Оригинал", "528 ₽", "Трусы женские", "4.8", "150 отзывов"], 1)
+    (c,) = candidates_from_tiles([tile])
+    assert (c.sku, c.slug, c.name) == ("123", "trusy-zhenskie", "Трусы женские")
+    assert c.url == "https://www.ozon.ru/product/trusy-zhenskie-123/"
+    assert (c.price, c.rating, c.reviews, c.is_original) == (528.0, 4.8, 150, True)

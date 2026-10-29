@@ -413,3 +413,20 @@ def parse_tiles(raw_tiles: list[dict], limit: int) -> list[SearchTile]:
         if len(out) >= limit:
             break
     return out
+
+
+
+
+def candidates_from_tiles(tiles: list[SearchTile]) -> list[Candidate]:
+    """Плитки с отрисованной страницы (подбор с прокруткой) -> кандидаты для отсева.
+    В data-state только первые 8 плиток, поэтому подбор читает плитки так же, как
+    снимок выдачи. Пометка «Оригинал» - по меткам и бейджам плитки."""
+    return [
+        Candidate(
+            sku=t.sku, url=t.url, slug=_slug_only(t.url), name=t.name,
+            price=t.price, original_price=t.original_price,
+            rating=t.rating, reviews=t.reviews,
+            is_original=any("Оригинал" in x for x in t.labels + t.badges),
+        )
+        for t in tiles
+    ]

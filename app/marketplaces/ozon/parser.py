@@ -719,6 +719,30 @@ class OzonParser:
         logger.info("Плиток на странице %s (нужно %s), прокруток %s", len(tiles), target, scrolls)
         return tiles, scrolls
 
+    def scroll_new_tiles(self, known: set[str], want: int, max_scrolls: int) -> tuple[list[dict], int]:
+        """Подбор: прокручивать выдачу, пока не отрисуется want плиток с новыми артикулами
+        (не из known), не больше max_scrolls раз; 2 прокрутки подряд без новых - выдача
+        кончилась. Новые считаются по артикулам, а не по числу плиток: Ozon может убирать
+        со страницы плитки, ушедшие далеко вверх. Возвращает (отрисованные плитки, прокруток)."""
+
+        def new_count(tiles: list[dict]) -> int:
+            skus = {self._sku_from_url((t.get("href") or "").split("?")[0]) for t in tiles}
+            return len({s for s in skus if s and s not in known})
+
+        tiles = self.collect_tiles()
+        new = new_count(tiles)
+        scrolls = stale = 0
+        while new < want and scrolls < max_scrolls and stale < 2:
+            self.driver.execute_script(f"window.scrollBy(0, {random.randint(1400, 2000)});")
+            time.sleep(random.uniform(2.0, 4.0))
+            scrolls += 1
+            tiles = self.collect_tiles()
+            fresh = new_count(tiles)
+            stale = stale + 1 if fresh <= new else 0
+            new = fresh
+        logger.info("Подбор: новых плиток %s (нужно %s), прокруток %s", new, want, scrolls)
+        return tiles, scrolls
+
 
     @staticmethod
     def _sku_from_url(url: str) -> str | None:

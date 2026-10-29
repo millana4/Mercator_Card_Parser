@@ -18,8 +18,9 @@ service.py — бизнес-логика парсинга Ozon (оркестра
     полученный на выдаче, остаётся в сессии выдачи.
     Вызовы выполняются по очереди под общей блокировкой;
   - подбор (select_for_stratum) — два своих браузера на задачу, отдельно от сессий
-    обхода и выдачи: браузер выдачи (только страницы поиска) и браузер карточек
-    (только карточки-кандидаты). Выдача и карточки в одном браузере не смешиваются
+    обхода и выдачи: браузер выдачи (поиск открыт всю задачу, догрузка прокруткой,
+    кандидаты — с отрисованных плиток) и браузер карточек (только карточки-кандидаты).
+    Выдача и карточки в одном браузере не смешиваются
     (до 13.10 переход «выдача → карточка» в одном браузере стабильно давал капчу).
     Каждый браузер начинает с главной Ozon и переходит изнутри Ozon (с Referer),
     лимит переходов — как у сессии обхода; капча — браузер закрывается, его профиль
@@ -53,7 +54,8 @@ from app.marketplaces.ozon.device_profile import DeviceProfile, pick_device
 from app.marketplaces.ozon.nuxt import extract_nuxt_state
 from app.marketplaces.ozon.parser import OzonParser
 from app.marketplaces.ozon.repository import OzonRepository
-from app.marketplaces.ozon.search_listing import extract_next_page, extract_pagination
+from app.marketplaces.ozon.search_listing import (candidates_from_tiles, extract_next_page,
+                                                  extract_pagination, parse_tiles)
 from app.marketplaces.ozon.selection import select_cards
 from app.shared.logger import emit_event
 
@@ -636,9 +638,11 @@ class OzonService:
         Подбор карточек под страту. Категорийная логика — в стратегии
         (app/categories), оркестрация — в selection.select_cards.
 
-        Два браузера на задачу (см. _SelectBrowsers): страницы выдачи — в браузере
-        выдачи подбора, карточки-кандидаты — в браузере карточек подбора. Сессии
-        обхода и выдачи подбор не трогает.
+        Два браузера на задачу (см. _SelectBrowsers): выдача — в браузере выдачи
+        подбора (открыта всю задачу, кандидаты читаются с отрисованных плиток,
+        догрузка — прокруткой), карточки-кандидаты — в браузере карточек подбора.
+        Капча после набранного — отдаётся набранное (blocked в результате).
+        Сессии обхода и выдачи подбор не трогает.
         """
         from app.categories.registry import get_strategy
 
@@ -654,23 +658,29 @@ class OzonService:
         pacer = NavigationPacer(self.policy.between_cards_min,
                                 self.policy.between_cards_max, sleep=self._sleep)
         browsers = _SelectBrowsers(self)
+        search_url = OzonRepository.search_url_from_query(req.query)
+        listing = {"opened": False}
 
-        def fetch_page(url):
-            # первая страница — по query (url=None), следующие — по nextPage
-            pacer.wait()
-            page_url = url or OzonRepository.search_url_from_query(req.query)
+        def load_candidates(known, want):
+            # Выдача одна, догружается прокруткой: первый раз - переход на поиск
+            # изнутри Ozon, дальше - прокрутка той же выдачи до want новых плиток.
             parser = browsers.get(SELECT_LISTING)
             try:
-                # переход на поиск изнутри Ozon, без прокрутки (пагинация - из __NUXT__)
-                html = parser.fetch_listing_scrolled(page_url, 0)
+                if not listing["opened"]:
+                    pacer.wait()
+                    try:
+                        parser.fetch_listing_scrolled(search_url, 0)
+                    finally:
+                        parser.consume_session_step()
+                    listing["opened"] = True
+                raw_tiles, _ = parser.scroll_new_tiles(known, want, self.policy.search_max_scrolls)
             except AntibotBlockedError as exc:
-                browsers.blocked(SELECT_LISTING, parser, exc, page_url)
+                browsers.blocked(SELECT_LISTING, parser, exc, search_url)
                 raise
             except WebDriverException as e:
-                raise browsers.failure(SELECT_LISTING, parser, e, page_url) from e
-            finally:
-                parser.consume_session_step()
-            return self._listing_raw(html, page_url, parser)
+                raise browsers.failure(SELECT_LISTING, parser, e, search_url) from e
+            tiles = [t for t in parse_tiles(raw_tiles, len(raw_tiles)) if t.sku not in known]
+            return candidates_from_tiles(tiles)
 
         def get_card_only(card_url):
             pacer.wait()
@@ -705,12 +715,14 @@ class OzonService:
             try:
                 return select_cards(
                     req,
-                    fetch_page=fetch_page,
+                    load_candidates=load_candidates,
                     get_card=get_card_only,
                     min_rating=min_rating,
                     min_reviews=min_reviews,
-                    max_pages=self.policy.max_pages,
+                    max_loads=self.policy.max_pages,
                     strategy=strategy,
+                    pool_multiplier=self.policy.pool_multiplier,
+                    min_pool=self.policy.search_tiles_target,
                 )
             finally:
                 browsers.close_all()

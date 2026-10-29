@@ -39,12 +39,21 @@ def handle_select(task: dict, service: OzonService) -> dict:
         result = service.select_for_stratum(req)
         cards = result["cards"]
         cards_data = [c.model_dump() if hasattr(c, "model_dump") else c for c in cards]
-        return {
+        out = {
             **echo, "ok": True,
             "requested_count": result["requested"],
             "found_count": result["found"],
             "cards": cards_data, "error": None,
         }
+        # Подбор прерван капчей или сбоем загрузки после набранного: ядру - набранное
+        # до капчи, воркеру - признак блокировки (пауза по банам, как при ошибке).
+        blocked = result.get("blocked")
+        if blocked is not None:
+            logger.warning("SELECT задача прервана (%s) — отдаю набранное %s из %s | task_id=%s",
+                           _error_text(blocked), result["found"], result["requested"],
+                           echo["task_id"])
+            out["_failure"] = _failure_kind(blocked)
+        return out
     except Exception as e:
         logger.exception("SELECT задача провалилась | task_id=%s", echo["task_id"])
         return {

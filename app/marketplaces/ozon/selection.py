@@ -6,10 +6,19 @@ selection.py — оркестрация подбора карточек под �
 живёт в app/categories/. Здесь остаётся то, что одинаково для всех
 категорий: листание выдачи, первичный отсев, заход в карточку, учёт слотов.
 
+Выдача Ozon одна и догружается прокруткой (страниц нет). Подбор берёт кандидатов
+догрузками: load_candidates(known, want) прокручивает выдачу и отдаёт кандидатов
+с новыми артикулами (не из known); не хватило — следующая догрузка, до max_loads
+раз или пока выдача не кончится. Один товар дважды не проверяется.
+
 Приоритет частых SKU: ядро передаёт priority_skus — SKU, часто встречавшиеся
-в поисковой выдаче страты (по убыванию частоты). На каждой странице после
+в поисковой выдаче страты (по убыванию частоты). В каждой догрузке после
 первичного отсева такие кандидаты проверяются первыми; остальные — в прежнем
 порядке. Число заходов в карточки не меняется.
+
+Капча или сбой загрузки (AntibotBlockedError) после того, как что-то уже набрано:
+подбор останавливается и отдаёт набранное до капчи с пометкой blocked; если не
+набрано ничего — ошибка пробрасывается.
 
 Модели контракта (StratumRequest, ExcludedCard, PrioritySku, Collection, Need)
 переехали в app/categories/models.py и реэкспортируются отсюда для совместимости.
@@ -21,7 +30,7 @@ from app.categories.models import Collection, ExcludedCard, Need, PrioritySku, S
 from app.categories.registry import get_strategy
 from app.core.exceptions import AntibotBlockedError
 from app.core.logging import get_logger
-from app.marketplaces.ozon.search_listing import extract_candidates, prefilter
+from app.marketplaces.ozon.search_listing import prefilter
 
 logger = get_logger(__name__)
 
@@ -84,24 +93,29 @@ def _rating_to_float(value) -> float | None:
 
 def select_cards(
     req: StratumRequest,
-    fetch_page,          # callable: (url|None) -> {"html","url","next_page"}
-    get_card,            # callable: (url) -> OzonCard  (это service.get_card)
+    load_candidates,     # callable: (known: set[str], want: int) -> [Candidate] с новыми sku; [] - выдача кончилась
+    get_card,            # callable: (url) -> OzonCard
     min_rating: float,
     min_reviews: int,
-    max_pages: int,
+    max_loads: int,
     today=None,
     strategy: CategoryStrategy | None = None,
+    pool_multiplier: int = 3,
+    min_pool: int = 32,
 ) -> dict:
     """
     Подобрать карточки под страту. Возвращает
-      {"cards": [OzonCard...], "requested": int, "found": int}.
+      {"cards": [OzonCard...], "requested": int, "found": int,
+       "blocked": AntibotBlockedError | None}.
+    blocked - подбор прерван капчей или сбоем загрузки, отдано набранное до неё.
 
     Стратегия категории берётся из req.category, если не передана явно.
     Пороги min_rating/min_reviews приходят уже согласованными с категорией
     (см. service.select_for_stratum).
 
-    Ленивая пагинация: следующая страница берётся, только если не хватило.
-    Частые SKU выдачи (req.priority_skus) на каждой странице проверяются первыми.
+    Догрузки: want = max(min_pool, недобор × pool_multiplier) новых плиток;
+    следующая догрузка — только если не хватило. Частые SKU выдачи
+    (req.priority_skus) в каждой догрузке проверяются первыми.
     """
     strategy = strategy or get_strategy(req.category)
 
@@ -120,7 +134,7 @@ def select_cards(
 
     if need.total == 0:
         logger.info("Подбор не требуется: потребность 0")
-        return {"cards": [], "requested": req.count, "found": 0}
+        return {"cards": [], "requested": req.count, "found": 0, "blocked": None}
 
     taken_sellers: set[str] = set()
     if strategy.require_unique_seller:
@@ -135,25 +149,42 @@ def select_cards(
     got_base = 0
     got_season = 0
     got_priority = 0
-    page_url = None                   # первая страница — по query
+    seen: set[str] = set()           # артикулы, уже взятые из выдачи (дважды не проверяем)
+    blocked: AntibotBlockedError | None = None
 
-    for page_no in range(1, max_pages + 1):
-        raw = fetch_page(page_url)
-        logger.info("Страница %s: %s", page_no, raw["url"])
+    def stop_on_block(exc: AntibotBlockedError) -> None:
+        """Капча или сбой загрузки: ничего не набрано - ошибка; иначе - отдать набранное."""
+        nonlocal blocked
+        if not picked:
+            raise exc
+        blocked = exc
+        logger.warning("Подбор прерван (%s) — отдаю набранное до капчи: %s из %s",
+                       exc, len(picked), need.total)
 
-        cands = extract_candidates(raw["html"])
-        logger.info("Страница %s: плиток извлечено=%s", page_no, len(cands))
+    for load_no in range(1, max_loads + 1):
+        want = max(min_pool, (need.total - len(picked)) * pool_multiplier)
+        try:
+            cands = load_candidates(seen, want)
+        except AntibotBlockedError as exc:
+            stop_on_block(exc)
+            break
+        cands = [c for c in cands if c.sku not in seen]
+        if not cands:
+            logger.info("Догрузка %s: новых плиток нет — выдача кончилась", load_no)
+            break
+        seen.update(c.sku for c in cands)
+        logger.info("Догрузка %s: новых плиток=%s (просили %s)", load_no, len(cands), want)
 
         pf = prefilter(cands, req.exclude, min_rating, min_reviews)
-        logger.info("Страница %s: после первичного отсева=%s "
+        logger.info("Догрузка %s: после первичного отсева=%s "
                     "(рейтинг>=%s, отзывы>%s, дедуп, исключения)",
-                    page_no, len(pf), min_rating, min_reviews)
+                    load_no, len(pf), min_rating, min_reviews)
 
         if freq:
             pf = prioritize(pf, req.priority_skus)
             on_page = sum(1 for c in pf if str(c.sku) in freq)
-            logger.info("Страница %s: частых в выдаче среди кандидатов=%s — проверяю их первыми",
-                        page_no, on_page)
+            logger.info("Догрузка %s: частых в выдаче среди кандидатов=%s — проверяю их первыми",
+                        load_no, on_page)
 
         for c in pf:
             if strategy.slots_full(need, got_base, got_season):
@@ -162,8 +193,9 @@ def select_cards(
             logger.info("Захожу в карточку sku=%s (%s)", c.sku, c.url)
             try:
                 card = get_card(c.url)
-            except AntibotBlockedError:
-                raise
+            except AntibotBlockedError as exc:
+                stop_on_block(exc)
+                break
             except Exception as e:
                 logger.warning("sku=%s: карточку получить не удалось (%s) — пропуск", c.sku, e)
                 continue
@@ -211,43 +243,21 @@ def select_cards(
                         got_season, need.seasonal,
                         got_base, need.base if need.season else need.total)
 
+        if blocked is not None:
+            break
         if strategy.slots_full(need, got_base, got_season):
-            logger.info("Набрано нужное количество — останавливаюсь на странице %s", page_no)
+            logger.info("Набрано нужное количество — останавливаюсь на догрузке %s", load_no)
             break
-
-        # решаем, есть ли следующая страница
-        current_page = raw.get("current_page")
-        total_pages = raw.get("total_pages")
-        nxt = raw.get("next_page")
-        has_next_by_nuxt = (current_page is not None and total_pages is not None
-                            and current_page < total_pages)
-
-        logger.info("Страница %s: плиток=%s | currentPage=%s totalPages=%s | "
-                    "nextPage=%s, есть_следующая(nuxt)=%s",
-                    page_no, len(cands), current_page, total_pages,
-                    "есть" if nxt else "нет", has_next_by_nuxt)
-
-        # гибрид: nextPage приоритетно (готовый URL с токенами), иначе строим page=N
-        if nxt:
-            page_url = nxt
-        elif has_next_by_nuxt:
-            from app.marketplaces.ozon.search_listing import build_next_page_url
-            page_url = build_next_page_url(raw["url"], current_page)
-            logger.info("nextPage нет — строю следующую страницу по page: %s", page_url)
-        else:
-            logger.info("Следующей страницы нет (currentPage>=totalPages) на странице %s", page_no)
-            break
-
-        logger.info("Не хватает (набрано %s/%s) — беру страницу %s",
-                    len(picked), need.total, page_no + 1)
+        logger.info("Не хватает (набрано %s/%s) — догружаю выдачу", len(picked), need.total)
     else:
-        logger.info("Достигнут потолок страниц (%s)", max_pages)
+        logger.info("Достигнут предел догрузок (%s)", max_loads)
 
     found = len(picked)
     logger.info("=== ПОДБОР ЗАВЕРШЁН | категория=%s | набрано %s из %s%s | "
                 "из них частых в выдаче %s ===",
                 strategy.name, found, need.total,
-                " (меньше нужного — штатный исход)" if found < need.total else "",
+                " (прерван капчей)" if blocked is not None
+                else (" (меньше нужного — штатный исход)" if found < need.total else ""),
                 got_priority)
 
-    return {"cards": picked, "requested": req.count, "found": found}
+    return {"cards": picked, "requested": req.count, "found": found, "blocked": blocked}
