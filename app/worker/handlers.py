@@ -5,8 +5,10 @@ handlers.py — обработчики задач select, search и parse.
 Логику подбора/парсинга не меняет.
 
 Внутреннее поле результата "_failure" (ban | load | expired | None) сообщает
-воркеру, была ли блокировка, сбой загрузки или устаревшая задача выдачи; воркер
-убирает его перед отправкой в ядро. Для ядра ban и load — error_code=antibot_blocked
+воркеру, была ли блокировка, сбой загрузки или устаревшая задача выдачи; "_session"
+— в какой сессии браузера она случилась, если не в сессии потока (плитки подбора —
+сессия выдачи). Воркер убирает оба поля перед отправкой в ядро.
+ Для ядра ban и load — error_code=antibot_blocked
 («повторить позже»), expired — error_code=expired (задача не выполнялась).
 """
 
@@ -53,15 +55,21 @@ def handle_select(task: dict, service: OzonService) -> dict:
                            _error_text(blocked), result["found"], result["requested"],
                            echo["task_id"])
             out["_failure"] = _failure_kind(blocked)
+            if getattr(blocked, "session", None):
+                out["_session"] = blocked.session
         return out
     except Exception as e:
         logger.exception("SELECT задача провалилась | task_id=%s", echo["task_id"])
-        return {
+        out = {
             **echo, "ok": False,
             "requested_count": task.get("count"), "found_count": 0,
             "cards": [], "error": _error_text(e), "error_code": _error_code(e),
             "_failure": _failure_kind(e),
         }
+        # капча в сессии выдачи (плитки подбора): воркер сменит её устройство и профиль
+        if getattr(e, "session", None):
+            out["_session"] = e.session
+        return out
 
 
 def handle_parse(task: dict, service: OzonService) -> dict:

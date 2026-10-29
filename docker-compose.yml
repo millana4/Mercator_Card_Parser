@@ -27,14 +27,13 @@ services:
       # Постоянные профили: сессия обхода (карточки) и сессия выдачи (поиск, подбор).
       - OZON_CHROME_PROFILE_DIR=/app/chrome-profile
       - OZON_SEARCH_PROFILE_DIR=/app/chrome-profile-search
-      # Подбор: свои браузеры выдачи и карточек со своими профилями (после капчи очищаются).
-      - OZON_SELECT_LISTING_PROFILE_DIR=/app/chrome-profile-select-listing
+      # Подбор: плитки - в сессии выдачи; карточки - свой браузер со своим профилем
+      # (после капчи очищается).
       - OZON_SELECT_CARDS_PROFILE_DIR=/app/chrome-profile-select-cards
     volumes:
       - ./app/debug:/app/app/debug
       - ./app/chrome-profile:/app/chrome-profile
       - ./app/chrome-profile-search:/app/chrome-profile-search
-      - ./app/chrome-profile-select-listing:/app/chrome-profile-select-listing
       - ./app/chrome-profile-select-cards:/app/chrome-profile-select-cards
     extra_hosts:
       - "host.docker.internal:host-gateway"

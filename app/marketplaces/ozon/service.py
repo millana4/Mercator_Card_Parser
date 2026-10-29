@@ -17,21 +17,21 @@ service.py — бизнес-логика парсинга Ozon (оркестра
     Сессия обхода никогда не открывает страницу поиска: вердикт антибота,
     полученный на выдаче, остаётся в сессии выдачи.
     Вызовы выполняются по очереди под общей блокировкой;
-  - подбор (select_for_stratum) — два своих браузера на задачу, отдельно от сессий
-    обхода и выдачи: браузер выдачи (поиск открыт всю задачу, догрузка прокруткой,
-    кандидаты — с отрисованных плиток) и браузер карточек (только карточки-кандидаты).
-    Выдача и карточки в одном браузере не смешиваются
-    (до 13.10 переход «выдача → карточка» в одном браузере стабильно давал капчу).
-    Каждый браузер начинает с главной Ozon и переходит изнутри Ozon (с Referer),
-    лимит переходов — как у сессии обхода; капча — браузер закрывается, его профиль
-    очищается; в конце задачи оба закрываются, профили с кукой остаются;
+  - подбор (select_for_stratum) — плитки выдачи в сессии выдачи (как снимок выдачи:
+    переход на запрос изнутри Ozon, догрузка прокруткой, кандидаты — с отрисованных
+    плиток), карточки-кандидаты — в своём браузере карточек подбора на время задачи
+    (главная Ozon, переходы изнутри Ozon, лимит переходов как у обхода; капча —
+    браузер закрывается, его профиль очищается; в конце задачи закрывается, профиль
+    с кукой остаётся). Выдача и карточки в одном браузере не смешиваются (до 13.10
+    переход «выдача → карточка» в одном браузере стабильно давал капчу).
+    Одновременно не больше трёх браузеров: обход, выдача, карточки подбора;
   - use_session=False (только диагностика): новый браузер на каждый вызов
     через repository.
 
 Постоянные профили:
 OZON_CHROME_PROFILE_DIR — сессия обхода,
-OZON_SEARCH_PROFILE_DIR — сессия выдачи,
-OZON_SELECT_LISTING_PROFILE_DIR и OZON_SELECT_CARDS_PROFILE_DIR — браузеры выдачи и карточек подбора.
+OZON_SEARCH_PROFILE_DIR — сессия выдачи (снимки выдачи и плитки подбора),
+OZON_SELECT_CARDS_PROFILE_DIR — браузер карточек подбора.
 Не задан — временный профиль.
 """
 
@@ -73,12 +73,10 @@ _SESSION_ATTR = {CRAWL: "_crawl_parser", SEARCH: "_search_parser"}
 _SESSION_PROFILE_ENV = {CRAWL: "OZON_CHROME_PROFILE_DIR", SEARCH: "OZON_SEARCH_PROFILE_DIR"}
 _SESSION_TITLE = {CRAWL: "обхода", SEARCH: "выдачи"}
 
-# Браузеры подбора: свои профили, отдельно от сессий обхода и выдачи.
-SELECT_LISTING = "select_listing"
+# Браузер карточек подбора: свой профиль, отдельно от сессий обхода и выдачи.
 SELECT_CARDS = "select_cards"
-_SELECT_PROFILE_ENV = {SELECT_LISTING: "OZON_SELECT_LISTING_PROFILE_DIR",
-                       SELECT_CARDS: "OZON_SELECT_CARDS_PROFILE_DIR"}
-_SELECT_TITLE = {SELECT_LISTING: "выдачи подбора", SELECT_CARDS: "карточек подбора"}
+_SELECT_PROFILE_ENV = {SELECT_CARDS: "OZON_SELECT_CARDS_PROFILE_DIR"}
+_SELECT_TITLE = {SELECT_CARDS: "карточек подбора"}
 
 
 def _wipe_profile(profile_dir: str | None) -> bool:
@@ -638,11 +636,14 @@ class OzonService:
         Подбор карточек под страту. Категорийная логика — в стратегии
         (app/categories), оркестрация — в selection.select_cards.
 
-        Два браузера на задачу (см. _SelectBrowsers): выдача — в браузере выдачи
-        подбора (открыта всю задачу, кандидаты читаются с отрисованных плиток,
-        догрузка — прокруткой), карточки-кандидаты — в браузере карточек подбора.
+        Плитки выдачи — в сессии выдачи (переход на запрос страты изнутри Ozon,
+        кандидаты читаются с отрисованных плиток, догрузка — прокруткой той же выдачи;
+        сессия остаётся открытой после задачи, как после снимка выдачи).
+        Карточки-кандидаты — в браузере карточек подбора (см. _SelectBrowsers).
         Капча после набранного — отдаётся набранное (blocked в результате).
-        Сессии обхода и выдачи подбор не трогает.
+        Капча в сессии выдачи помечается session=SEARCH: воркер, как при снимке
+        выдачи, меняет устройство сессии и очищает её профиль. Сессию обхода подбор
+        не трогает.
         """
         from app.categories.registry import get_strategy
 
@@ -659,26 +660,31 @@ class OzonService:
                                 self.policy.between_cards_max, sleep=self._sleep)
         browsers = _SelectBrowsers(self)
         search_url = OzonRepository.search_url_from_query(req.query)
-        listing = {"opened": False}
+        listing = {"parser": None}          # сессия выдачи, открывшая выдачу страты
 
         def load_candidates(known, want):
-            # Выдача одна, догружается прокруткой: первый раз - переход на поиск
-            # изнутри Ozon, дальше - прокрутка той же выдачи до want новых плиток.
-            parser = browsers.get(SELECT_LISTING)
+            # Плитки подбора - в сессии выдачи, как снимок выдачи: первый раз переход
+            # на запрос страты изнутри Ozon, дальше - прокрутка той же выдачи до want
+            # новых плиток (прокрутка лимит переходов не тратит).
+            parser = listing["parser"]
             try:
-                if not listing["opened"]:
+                if parser is None:
                     pacer.wait()
+                    parser = self._ensure_session(SEARCH)
                     try:
                         parser.fetch_listing_scrolled(search_url, 0)
                     finally:
                         parser.consume_session_step()
-                    listing["opened"] = True
+                    listing["parser"] = parser
                 raw_tiles, _ = parser.scroll_new_tiles(known, want, self.policy.search_max_scrolls)
             except AntibotBlockedError as exc:
-                browsers.blocked(SELECT_LISTING, parser, exc, search_url)
+                self._close_after_block(SEARCH, parser, exc, search_url)
+                exc.session = SEARCH            # воркеру: сменить устройство и профиль выдачи
                 raise
             except WebDriverException as e:
-                raise browsers.failure(SELECT_LISTING, parser, e, search_url) from e
+                failure = self._browser_failure(SEARCH, parser, e, search_url)
+                failure.session = SEARCH
+                raise failure from e
             tiles = [t for t in parse_tiles(raw_tiles, len(raw_tiles)) if t.sku not in known]
             return candidates_from_tiles(tiles)
 
@@ -729,19 +735,19 @@ class OzonService:
 
 
 class _SelectBrowsers:
-    """Браузеры одной задачи подбора: выдачи (SELECT_LISTING) и карточек (SELECT_CARDS).
+    """Браузер карточек одной задачи подбора (SELECT_CARDS).
 
-    У каждого свой постоянный профиль (OZON_SELECT_LISTING_PROFILE_DIR,
-    OZON_SELECT_CARDS_PROFILE_DIR; не задан — временный): кука с главной копится
-    между задачами. Браузер начинает сессию с главной Ozon (begin_session) и дальше
-    переходит изнутри Ozon; исчерпан лимит переходов — новый браузер, снова с главной.
-    Капча — браузер закрывается, его профиль очищается (следующий начнёт с чистого);
-    сбой загрузки — браузер закрывается, профиль остаётся. В конце задачи — close_all.
+    Свой постоянный профиль (OZON_SELECT_CARDS_PROFILE_DIR; не задан — временный):
+    кука с главной копится между задачами. Браузер начинает сессию с главной Ozon
+    (begin_session) и дальше переходит изнутри Ozon; исчерпан лимит переходов —
+    новый браузер, снова с главной. Капча — браузер закрывается, его профиль
+    очищается (следующий начнёт с чистого); сбой загрузки — браузер закрывается,
+    профиль остаётся. В конце задачи — close_all.
     """
 
     def __init__(self, service: "OzonService"):
         self._service = service
-        self._parsers = {SELECT_LISTING: None, SELECT_CARDS: None}
+        self._parsers = {SELECT_CARDS: None}
 
     @staticmethod
     def profile_dir(kind: str) -> str:

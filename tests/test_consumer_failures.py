@@ -70,7 +70,7 @@ def test_lanes_and_sessions_by_stream():
 def test_ban_registered_immediately_in_stream_lane():
     consumer = make_consumer()
     bans = []
-    consumer._register_ban = lambda lane, stream, reason: bans.append((lane, stream))
+    consumer._register_ban = lambda lane, stream, reason, session=None: bans.append((lane, stream))
     consumer._track_failure("ban", "select")
     assert bans == [(SEARCH, "select")]
 
@@ -78,7 +78,7 @@ def test_ban_registered_immediately_in_stream_lane():
 def test_load_failures_counted_per_lane():
     consumer = make_consumer()
     bans = []
-    consumer._register_ban = lambda lane, stream, reason: bans.append(lane)
+    consumer._register_ban = lambda lane, stream, reason, session=None: bans.append(lane)
     consumer._track_failure("load", "parse")
     consumer._track_failure("load", "parse")
     consumer._track_failure("load", "search")   # своя полоса — серия обхода не растёт
@@ -181,3 +181,16 @@ def test_crawl_pause_end_makes_next_task_probe():
     consumer._lanes[CRAWL].until = time.time() + 0.05
     assert consumer._wait_ban_pause() is True
     assert consumer._probe_pending is True
+
+
+
+
+def test_ban_passes_session_of_blocked_browser():
+    """Капча на плитках подбора: в регистрацию бана уходит сессия выдачи (смена
+    устройства и профиля выдачи); без пометки - сессия не задана."""
+    consumer = make_consumer()
+    sessions = []
+    consumer._register_ban = lambda lane, stream, reason, session=None: sessions.append(session)
+    consumer._track_failure("ban", "select", "search")
+    consumer._track_failure("ban", "select")
+    assert sessions == ["search", None]

@@ -189,8 +189,9 @@ class TaskConsumer:
             result = handle_parse(task, self.service)
             result_key = rws.parse_results_key(marketplace)
 
-        # Внутренний признак блокировки/сбоя — ядру не отправляем.
+        # Внутренний признак блокировки/сбоя и сессия, где он случился, — ядру не отправляем.
         failure = result.pop("_failure", None)
+        failure_session = result.pop("_session", None)
         # Проставляем, какой воркер отдал результат (наблюдаемость).
         result["parser_id"] = rws.parser_id
 
@@ -218,30 +219,34 @@ class TaskConsumer:
             self.producer.incr_counter(rws.counter_done(marketplace))
 
         # Пауза — в полосе задачи; профиль и устройство — у сессии задачи.
-        self._track_failure(failure, stream)
+        self._track_failure(failure, stream, failure_session)
         if time.time() < self._lanes[CRAWL].until:
             return  # пауза обхода — в начале следующей итерации цикла
         self._pause_between_cards()
 
     # ------------------------------------------------------------------ #
-    def _track_failure(self, failure: str | None, stream: str) -> None:
+    def _track_failure(self, failure: str | None, stream: str,
+                       session: str | None = None) -> None:
         """Учёт блокировок в полосе потока: ban — сразу бан; load — бан после серии
-        сбоев подряд; любой другой исход (страница загрузилась) обнуляет серию."""
+        сбоев подряд; любой другой исход (страница загрузилась) обнуляет серию.
+        session — сессия браузера, где случилась блокировка, если не сессия потока."""
         lane = LANE_BY_STREAM.get(stream, CRAWL)
         state = self._lanes[lane]
         if failure == "ban":
-            self._register_ban(lane, stream, "капча или блокировка")
+            self._register_ban(lane, stream, "капча или блокировка", session)
         elif failure == "load":
             state.load_failures += 1
             threshold = self._policy.load_failure_threshold
             logger.warning("Сбой загрузки подряд (%s): %s/%s",
                            LANE_TITLE[lane], state.load_failures, threshold)
             if state.load_failures >= threshold:
-                self._register_ban(lane, stream, f"сбоев загрузки подряд: {state.load_failures}")
+                self._register_ban(lane, stream, f"сбоев загрузки подряд: {state.load_failures}",
+                                   session)
         else:
             state.load_failures = 0
 
-    def _register_ban(self, lane: str, stream: str, reason: str) -> None:
+    def _register_ban(self, lane: str, stream: str, reason: str,
+                      session: str | None = None) -> None:
         """Бан в полосе: уровень и пауза полосы; у сессии потока — новое устройство
         и сброс профиля. Уровень растёт, если с конца прошлой паузы полосы прошло
         меньше ban_level_reset_s, иначе снова 1."""
@@ -261,9 +266,9 @@ class TaskConsumer:
             logger.warning("БАН выдачи и подбора (%s, поток %s): уровень %s, пауза %.0f мин до %s — "
                            "обход продолжается", reason, stream, level, pause / 60, until_text)
 
-        session = SESSION_BY_STREAM.get(stream)
+        session = session or SESSION_BY_STREAM.get(stream)
         if session is None:
-            return  # подбор: новые браузеры с временным профилем — сбрасывать нечего
+            return  # подбор, капча в браузере карточек: его профиль сервис уже очистил
         self._generations[session] += 1
         logger.warning("Новое устройство сессии %s (поколение %s), сбрасываю её профиль",
                        session, self._generations[session])

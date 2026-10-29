@@ -1,10 +1,11 @@
 # -*- coding: utf-8 -*-
-"""Подбор: два своих браузера на задачу — выдачи и карточек, со своими постоянными
-профилями. Каждый начинает с главной Ozon (begin_session) и переходит изнутри Ozon;
-выдача и карточки не смешиваются; сессии обхода и выдачи подбор не трогает.
-Выдача открывается один раз и догружается прокруткой, кандидаты — с отрисованных плиток.
-Капча — профиль поймавшего браузера очищается; сбой загрузки — профиль остаётся.
-Капча после набранного — обработчик отдаёт набранное с признаком блокировки."""
+"""Подбор: плитки выдачи — в сессии выдачи (как снимок выдачи), карточки-кандидаты —
+в своём браузере карточек подбора с постоянным профилем. Выдача и карточки не
+смешиваются; сессию обхода подбор не трогает; сессия выдачи после задачи остаётся.
+Выдача открывается один раз за задачу и догружается прокруткой, кандидаты — с
+отрисованных плиток. Капча в браузере карточек — его профиль очищается; капча в сессии
+выдачи — сессия закрывается, ошибка помечается session=search (профиль и устройство
+сменит воркер). Капча после набранного — обработчик отдаёт набранное с признаком."""
 import os
 from types import SimpleNamespace
 
@@ -32,6 +33,7 @@ class FakeParser:
     created = []
     session_limit = 30
     fail_on_card = None          # исключение при открытии карточки
+    fail_on_scroll = None        # исключение при прокрутке выдачи
 
     def __init__(self, policy, device=None, profile_dir=None):
         self.profile_dir = profile_dir
@@ -55,6 +57,8 @@ class FakeParser:
         return PAGE
 
     def scroll_new_tiles(self, known, want, max_scrolls):
+        if FakeParser.fail_on_scroll is not None:
+            raise FakeParser.fail_on_scroll
         self.actions.append(("scroll", want))
         return RAW_TILES, 1
 
@@ -76,11 +80,11 @@ class FakeParser:
 
 @pytest.fixture
 def env(monkeypatch, tmp_path):
-    listing_dir, cards_dir = tmp_path / "listing", tmp_path / "cards"
-    for d in (listing_dir, cards_dir):
+    search_dir, cards_dir = tmp_path / "search", tmp_path / "cards"
+    for d in (search_dir, cards_dir):
         d.mkdir()
         (d / "Cookies").write_text("x")
-    monkeypatch.setenv("OZON_SELECT_LISTING_PROFILE_DIR", str(listing_dir))
+    monkeypatch.setenv("OZON_SEARCH_PROFILE_DIR", str(search_dir))
     monkeypatch.setenv("OZON_SELECT_CARDS_PROFILE_DIR", str(cards_dir))
     monkeypatch.setattr(settings, "debug", False)
     monkeypatch.setattr(settings, "debug_dir", str(tmp_path / "debug"))
@@ -88,10 +92,11 @@ def env(monkeypatch, tmp_path):
     monkeypatch.setattr(service_module, "extract_nuxt_state", lambda html: {})
     monkeypatch.setattr(service_module, "build_card",
                         lambda html, nuxt, url: SimpleNamespace(sku=url, model_dump=lambda: {"url": url}))
-    FakeParser.created, FakeParser.session_limit, FakeParser.fail_on_card = [], 30, None
+    FakeParser.created, FakeParser.session_limit = [], 30
+    FakeParser.fail_on_card = FakeParser.fail_on_scroll = None
     service = OzonService(use_session=True)
     service._sleep = lambda seconds: None
-    return service, listing_dir, cards_dir
+    return service, search_dir, cards_dir
 
 
 def _run(service, monkeypatch, steps):
@@ -114,18 +119,30 @@ def _run(service, monkeypatch, steps):
     return loaded
 
 
-def test_listing_opened_once_and_scrolled_cards_in_own_browser(env, monkeypatch):
-    service, listing_dir, cards_dir = env
+def test_tiles_in_search_session_cards_in_own_browser(env, monkeypatch):
+    service, search_dir, cards_dir = env
     _run(service, monkeypatch, [("load", set(), 32), ("card", "c1"), ("load", {"111"}, 30), ("card", "c2")])
 
-    listing, cards = FakeParser.created
-    assert listing.profile_dir == str(listing_dir) and cards.profile_dir == str(cards_dir)
+    search, cards = FakeParser.created
+    assert service._search_parser is search                    # плитки - в сессии выдачи
+    assert search.profile_dir == str(search_dir) and cards.profile_dir == str(cards_dir)
     # выдача открыта один раз, дальше - только прокрутка той же выдачи
-    assert listing.actions == ["home", ("listing", SEARCH_URL, 0), ("scroll", 32), ("scroll", 30)]
+    assert search.actions == ["home", ("listing", SEARCH_URL, 0), ("scroll", 32), ("scroll", 30)]
     assert cards.actions == ["home", ("card", "c1", True), ("card", "c2", True)]
-    assert listing.closed and cards.closed                     # в конце задачи
-    assert service._crawl_parser is None and service._search_parser is None
-    assert os.listdir(listing_dir) == ["Cookies"] and os.listdir(cards_dir) == ["Cookies"]
+    assert cards.closed and not search.closed                  # сессия выдачи остаётся открытой
+    assert service._crawl_parser is None
+    assert os.listdir(search_dir) == ["Cookies"] and os.listdir(cards_dir) == ["Cookies"]
+
+
+def test_search_session_reused_by_next_select(env, monkeypatch):
+    """Следующая задача подбора - та же сессия выдачи, без нового захода на главную."""
+    service, _, _ = env
+    _run(service, monkeypatch, [("load", set(), 32)])
+    _run(service, monkeypatch, [("load", set(), 32)])
+    search = service._search_parser
+    assert search.actions == ["home", ("listing", SEARCH_URL, 0), ("scroll", 32),
+                              ("listing", SEARCH_URL, 0), ("scroll", 32)]
+    assert len(FakeParser.created) == 1                        # карточки не открывались
 
 
 def test_candidates_read_from_rendered_tiles_without_known(env, monkeypatch):
@@ -142,24 +159,39 @@ def test_cards_browser_recreated_when_session_exhausted(env, monkeypatch):
     FakeParser.session_limit = 2
     _run(service, monkeypatch, [("load", set(), 32), ("card", "c1"), ("card", "c2"), ("card", "c3")])
 
-    cards = FakeParser.created[1:]
+    cards = FakeParser.created[1:]                             # [0] - сессия выдачи
     assert len(cards) == 2
     assert cards[0].actions == ["home", ("card", "c1", True), ("card", "c2", True)]
     assert cards[1].actions == ["home", ("card", "c3", True)]   # новый браузер — снова с главной
-    assert all(p.closed for p in FakeParser.created)
+    assert all(p.closed for p in cards)
 
 
-def test_captcha_wipes_only_profile_of_its_browser(env, monkeypatch):
-    service, listing_dir, cards_dir = env
+def test_captcha_in_cards_wipes_only_cards_profile(env, monkeypatch):
+    service, search_dir, cards_dir = env
     FakeParser.fail_on_card = AntibotBlockedError("капча", marketplace="ozon")
-    with pytest.raises(AntibotBlockedError):
+    with pytest.raises(AntibotBlockedError) as err:
         _run(service, monkeypatch, [("load", set(), 32), ("card", "c1")])
 
+    assert getattr(err.value, "session", None) is None         # не сессия выдачи
     assert os.listdir(cards_dir) == []                         # профиль карточек очищен
-    assert os.listdir(listing_dir) == ["Cookies"]              # профиль выдачи цел
-    assert all(p.closed for p in FakeParser.created)
+    assert os.listdir(search_dir) == ["Cookies"]               # профиль выдачи цел
+    search, cards = FakeParser.created
+    assert cards.closed and not search.closed                  # сессия выдачи работает дальше
     blocks = [n for n in os.listdir(settings.debug_dir) if n.endswith(".json")]
     assert len(blocks) == 1
+
+
+def test_captcha_in_search_session_marked_for_worker(env, monkeypatch):
+    """Капча на плитках: сессия выдачи закрыта, ошибка помечена session=search -
+    устройство и профиль выдачи сменит воркер, как при снимке выдачи."""
+    service, search_dir, _ = env
+    FakeParser.fail_on_scroll = AntibotBlockedError("капча", marketplace="ozon")
+    with pytest.raises(AntibotBlockedError) as err:
+        _run(service, monkeypatch, [("load", set(), 32)])
+
+    assert err.value.session == service_module.SEARCH
+    assert service._search_parser is None
+    assert os.listdir(search_dir) == ["Cookies"]               # профиль сбросит воркер
 
 
 def test_page_load_error_keeps_profile(env, monkeypatch):
@@ -172,7 +204,7 @@ def test_page_load_error_keeps_profile(env, monkeypatch):
 
 def test_temporary_profiles_without_env(env, monkeypatch):
     service, _, _ = env
-    monkeypatch.delenv("OZON_SELECT_LISTING_PROFILE_DIR")
+    monkeypatch.delenv("OZON_SEARCH_PROFILE_DIR")
     monkeypatch.delenv("OZON_SELECT_CARDS_PROFILE_DIR")
     _run(service, monkeypatch, [("load", set(), 32), ("card", "c1")])
     assert [p.profile_dir for p in FakeParser.created] == ["", ""]
@@ -197,7 +229,20 @@ def test_handler_returns_partial_with_ban_mark():
 
     r = handle_select({"task_id": "t", "query": "юбка для девочки", "count": 3}, Service())
     assert r["ok"] is True and r["found_count"] == 1 and r["cards"] == [{"sku": "1"}]
-    assert r["_failure"] == "ban"
+    assert r["_failure"] == "ban" and "_session" not in r
+
+
+def test_handler_marks_search_session_on_tiles_captcha():
+    """Капча на плитках подбора: воркеру - сессия выдачи (смена устройства и профиля)."""
+    class Service:
+        def select_for_stratum(self, req):
+            exc = AntibotBlockedError("капча", marketplace="ozon")
+            exc.session = service_module.SEARCH
+            raise exc
+
+    r = handle_select({"task_id": "t", "query": "юбка для девочки", "count": 3}, Service())
+    assert r["ok"] is False and r["_failure"] == "ban"
+    assert r["_session"] == service_module.SEARCH
 
 
 def test_repository_uses_temporary_profile(monkeypatch):
