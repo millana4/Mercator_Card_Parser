@@ -17,14 +17,21 @@ service.py — бизнес-логика парсинга Ozon (оркестра
     Сессия обхода никогда не открывает страницу поиска: вердикт антибота,
     полученный на выдаче, остаётся в сессии выдачи.
     Вызовы выполняются по очереди под общей блокировкой;
-  - подбор (select_for_stratum) — всегда новый браузер с временным профилем на
-    каждую страницу выдачи и каждую карточку, через repository (как до 13.10:
-    в долгоживущей сессии переход «выдача → карточка» стабильно давал капчу);
+  - подбор (select_for_stratum) — два своих браузера на задачу, отдельно от сессий
+    обхода и выдачи: браузер выдачи (только страницы поиска) и браузер карточек
+    (только карточки-кандидаты). Выдача и карточки в одном браузере не смешиваются
+    (до 13.10 переход «выдача → карточка» в одном браузере стабильно давал капчу).
+    Каждый браузер начинает с главной Ozon и переходит изнутри Ozon (с Referer),
+    лимит переходов — как у сессии обхода; капча — браузер закрывается, его профиль
+    очищается; в конце задачи оба закрываются, профили с кукой остаются;
   - use_session=False (только диагностика): новый браузер на каждый вызов
     через repository.
 
-Постоянные профили: OZON_CHROME_PROFILE_DIR — сессия обхода,
-OZON_SEARCH_PROFILE_DIR — сессия выдачи. Не задан — временный профиль.
+Постоянные профили:
+OZON_CHROME_PROFILE_DIR — сессия обхода,
+OZON_SEARCH_PROFILE_DIR — сессия выдачи,
+OZON_SELECT_LISTING_PROFILE_DIR и OZON_SELECT_CARDS_PROFILE_DIR — браузеры выдачи и карточек подбора.
+Не задан — временный профиль.
 """
 
 import os
@@ -63,6 +70,30 @@ SESSIONS = (CRAWL, SEARCH)
 _SESSION_ATTR = {CRAWL: "_crawl_parser", SEARCH: "_search_parser"}
 _SESSION_PROFILE_ENV = {CRAWL: "OZON_CHROME_PROFILE_DIR", SEARCH: "OZON_SEARCH_PROFILE_DIR"}
 _SESSION_TITLE = {CRAWL: "обхода", SEARCH: "выдачи"}
+
+# Браузеры подбора: свои профили, отдельно от сессий обхода и выдачи.
+SELECT_LISTING = "select_listing"
+SELECT_CARDS = "select_cards"
+_SELECT_PROFILE_ENV = {SELECT_LISTING: "OZON_SELECT_LISTING_PROFILE_DIR",
+                       SELECT_CARDS: "OZON_SELECT_CARDS_PROFILE_DIR"}
+_SELECT_TITLE = {SELECT_LISTING: "выдачи подбора", SELECT_CARDS: "карточек подбора"}
+
+
+def _wipe_profile(profile_dir: str | None) -> bool:
+    """Удалить содержимое постоянного профиля Chrome (сам каталог - том - остаётся).
+    False - профиль не задан или каталога нет."""
+    if not profile_dir or not os.path.isdir(profile_dir):
+        return False
+    for entry in os.listdir(profile_dir):
+        path = os.path.join(profile_dir, entry)
+        try:
+            if os.path.isdir(path) and not os.path.islink(path):
+                shutil.rmtree(path)
+            else:
+                os.remove(path)
+        except Exception as e:
+            logger.warning("Не удалось удалить %s из профиля: %s", path, e)
+    return True
 
 class NavigationPacer:
     """Пауза между переходами внутри одной задачи (подбор: страницы выдачи и
@@ -175,6 +206,11 @@ class OzonService:
             raise self._browser_failure(SEARCH, parser, e, page_url) from e
         finally:
             parser.consume_session_step()
+        return self._listing_raw(html, page_url, parser)
+
+    @staticmethod
+    def _listing_raw(html: str, page_url: str, parser) -> dict:
+        """Сырьё страницы выдачи из HTML: пагинация из __NUXT__, nextPage из паджинатора."""
         nuxt = {}
         try:
             nuxt = extract_nuxt_state(html) or {}
@@ -356,19 +392,9 @@ class OzonService:
             for name in ([session] if session else SESSIONS):
                 self._close_session(name)
                 profile_dir = os.environ.get(_SESSION_PROFILE_ENV[name])
-                if not profile_dir or not os.path.isdir(profile_dir):
-                    continue
-                for entry in os.listdir(profile_dir):
-                    path = os.path.join(profile_dir, entry)
-                    try:
-                        if os.path.isdir(path) and not os.path.islink(path):
-                            shutil.rmtree(path)
-                        else:
-                            os.remove(path)
-                    except Exception as e:
-                        logger.warning("Не удалось удалить %s из профиля: %s", path, e)
-                logger.warning("Профиль браузера сессии %s сброшен: %s",
-                               _SESSION_TITLE[name], profile_dir)
+                if _wipe_profile(profile_dir):
+                    logger.warning("Профиль браузера сессии %s сброшен: %s",
+                                   _SESSION_TITLE[name], profile_dir)
 
     def get_card_for_crawl(self, url: str, full_content: bool = False) -> dict:
         """Разобрать карточку в рамках долгоживущей сессии (путь ОБХОДА).
@@ -609,8 +635,10 @@ class OzonService:
         """
         Подбор карточек под страту. Категорийная логика — в стратегии
         (app/categories), оркестрация — в selection.select_cards.
-        Каждая страница выдачи и каждая карточка — новый браузер с временным
-        профилем (fresh=True); долгоживущие сессии подбор не трогает.
+
+        Два браузера на задачу (см. _SelectBrowsers): страницы выдачи — в браузере
+        выдачи подбора, карточки-кандидаты — в браузере карточек подбора. Сессии
+        обхода и выдачи подбор не трогает.
         """
         from app.categories.registry import get_strategy
 
@@ -625,25 +653,124 @@ class OzonService:
         # Пауза между переходами внутри задачи — та же, что между карточками обхода.
         pacer = NavigationPacer(self.policy.between_cards_min,
                                 self.policy.between_cards_max, sleep=self._sleep)
+        browsers = _SelectBrowsers(self)
 
         def fetch_page(url):
             # первая страница — по query (url=None), следующие — по nextPage
             pacer.wait()
-            return self._fetch_listing(query=req.query if url is None else None, url=url,
-                                       fresh=True)
+            page_url = url or OzonRepository.search_url_from_query(req.query)
+            parser = browsers.get(SELECT_LISTING)
+            try:
+                # переход на поиск изнутри Ozon, без прокрутки (пагинация - из __NUXT__)
+                html = parser.fetch_listing_scrolled(page_url, 0)
+            except AntibotBlockedError as exc:
+                browsers.blocked(SELECT_LISTING, parser, exc, page_url)
+                raise
+            except WebDriverException as e:
+                raise browsers.failure(SELECT_LISTING, parser, e, page_url) from e
+            finally:
+                parser.consume_session_step()
+            return self._listing_raw(html, page_url, parser)
 
         def get_card_only(card_url):
             pacer.wait()
-            res = self.get_card(card_url, fresh=True)
-            return OzonCard(**res["card"])
+            t0 = time.monotonic()
+            parser = browsers.get(SELECT_CARDS)
+            try:
+                html = parser.fetch_html_in_session(card_url, full_content=True)
+            except OutOfStockError:
+                raise                       # selection пропустит кандидата
+            except AntibotBlockedError as exc:
+                browsers.blocked(SELECT_CARDS, parser, exc, card_url)
+                self._emit_blocked(card_url, exc)
+                raise
+            except WebDriverException as e:
+                failure = browsers.failure(SELECT_CARDS, parser, e, card_url)
+                self._emit_blocked(card_url, failure)
+                raise failure from e
+            finally:
+                parser.consume_session_step()
+            not_found = ('data-widget="error"' in html
+                         or "Такой страницы не существует" in html)
+            nuxt = {} if not_found else extract_nuxt_state(html)
+            card = build_card(html, nuxt, card_url)
+            raw = {"html": html, "nuxt_state": nuxt, "url": card_url,
+                   "screenshot_png": parser.screenshot_png() if settings.debug else None}
+            self._save_debug(self._basename(card_url), raw, card.model_dump())
+            emit_event("ozon.card.parsed", {"url": card_url, "sku": card.sku,
+                                            "took_s": round(time.monotonic() - t0, 2)})
+            return card
 
         with self._lock:
-            return select_cards(
-                req,
-                fetch_page=fetch_page,
-                get_card=get_card_only,
-                min_rating=min_rating,
-                min_reviews=min_reviews,
-                max_pages=self.policy.max_pages,
-                strategy=strategy,
-            )
+            try:
+                return select_cards(
+                    req,
+                    fetch_page=fetch_page,
+                    get_card=get_card_only,
+                    min_rating=min_rating,
+                    min_reviews=min_reviews,
+                    max_pages=self.policy.max_pages,
+                    strategy=strategy,
+                )
+            finally:
+                browsers.close_all()
+
+
+class _SelectBrowsers:
+    """Браузеры одной задачи подбора: выдачи (SELECT_LISTING) и карточек (SELECT_CARDS).
+
+    У каждого свой постоянный профиль (OZON_SELECT_LISTING_PROFILE_DIR,
+    OZON_SELECT_CARDS_PROFILE_DIR; не задан — временный): кука с главной копится
+    между задачами. Браузер начинает сессию с главной Ozon (begin_session) и дальше
+    переходит изнутри Ozon; исчерпан лимит переходов — новый браузер, снова с главной.
+    Капча — браузер закрывается, его профиль очищается (следующий начнёт с чистого);
+    сбой загрузки — браузер закрывается, профиль остаётся. В конце задачи — close_all.
+    """
+
+    def __init__(self, service: "OzonService"):
+        self._service = service
+        self._parsers = {SELECT_LISTING: None, SELECT_CARDS: None}
+
+    @staticmethod
+    def profile_dir(kind: str) -> str:
+        return os.environ.get(_SELECT_PROFILE_ENV[kind]) or ""
+
+    def get(self, kind: str):
+        """Живой браузер с неисчерпанным лимитом переходов; нет — новый, с главной Ozon."""
+        parser = self._parsers[kind]
+        if parser is not None and not parser.session_exhausted():
+            return parser
+        self.close(kind)
+        logger.info("Подбор: новый браузер %s", _SELECT_TITLE[kind])
+        parser = OzonParser(self._service.policy, profile_dir=self.profile_dir(kind))
+        self._parsers[kind] = parser
+        parser.begin_session()
+        return parser
+
+    def close(self, kind: str) -> None:
+        parser = self._parsers[kind]
+        if parser is not None:
+            try:
+                parser.close()
+            except Exception as e:
+                logger.debug("Ошибка закрытия браузера %s: %s", _SELECT_TITLE[kind], e)
+            self._parsers[kind] = None
+
+    def close_all(self) -> None:
+        for kind in self._parsers:
+            self.close(kind)
+
+    def blocked(self, kind: str, parser, exc: AntibotBlockedError, url: str) -> None:
+        """Снимок блокировки, закрытие браузера; при капче — очистка его профиля."""
+        self._service._save_block_artifacts(parser, exc, url, session=kind)
+        self.close(kind)
+        if not isinstance(exc, PageLoadError) and _wipe_profile(self.profile_dir(kind)):
+            logger.warning("Профиль браузера %s очищен после капчи: %s",
+                           _SELECT_TITLE[kind], self.profile_dir(kind))
+
+    def failure(self, kind: str, parser, e: WebDriverException, url: str) -> PageLoadError:
+        """Браузер не отвечает — сбой загрузки: снимок, закрытие, профиль остаётся."""
+        first_line = (getattr(e, "msg", None) or type(e).__name__).splitlines()[0][:200]
+        failure = PageLoadError(f"Браузер не отвечает: {first_line}", marketplace="ozon")
+        self.blocked(kind, parser, failure, url)
+        return failure

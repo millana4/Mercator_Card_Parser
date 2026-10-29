@@ -1,8 +1,7 @@
 # -*- coding: utf-8 -*-
-"""Пауза между переходами внутри задачи подбора (каждая страница — новый браузер)."""
-import app.marketplaces.ozon.service as service_module
-from app.categories.models import StratumRequest
-from app.marketplaces.ozon.service import NavigationPacer, OzonService
+"""Пауза между переходами внутри задачи подбора (NavigationPacer).
+Паузы самого подбора — в test_select_browsers.py."""
+from app.marketplaces.ozon.service import NavigationPacer
 
 
 def test_pacer_first_wait_without_pause():
@@ -19,39 +18,3 @@ def test_pacer_next_waits_in_range():
         pacer.wait()
     assert len(calls) == 3
     assert all(50.0 <= d <= 90.0 for d in calls)
-
-
-def test_select_pauses_between_navigations(monkeypatch):
-    service = OzonService(use_session=True)
-    sleeps = []
-    service._sleep = sleeps.append
-    navigations = []
-
-    def fake_fetch_listing(query=None, url=None, fresh=False):
-        navigations.append(("page", query, url, fresh))
-        return {"html": "", "url": "u"}
-
-    def fake_get_card(card_url, full_content=True, fresh=False):
-        navigations.append(("card", card_url, fresh))
-        return {"card": {"sku": card_url}}
-
-    def fake_select_cards(req, fetch_page, get_card, **kwargs):
-        fetch_page(None)
-        get_card("a")
-        get_card("b")
-        return {"cards": [], "requested": req.count, "found": 0}
-
-    monkeypatch.setattr(service, "_fetch_listing", fake_fetch_listing)
-    monkeypatch.setattr(service, "get_card", fake_get_card)
-    monkeypatch.setattr(service_module, "select_cards", fake_select_cards)
-    monkeypatch.setattr(service_module, "OzonCard", lambda **kw: kw)
-
-    req = StratumRequest(query="лонгслив", count=2, is_seasonal=False,
-                         base_share=None, exclude=[], category="kids_clothing")
-    service.select_for_stratum(req)
-
-    # подбор — новым браузером на каждую страницу (fresh=True)
-    assert navigations == [("page", "лонгслив", None, True), ("card", "a", True), ("card", "b", True)]
-    assert len(sleeps) == 2
-    lo, hi = service.policy.between_cards_min, service.policy.between_cards_max
-    assert all(lo <= d <= hi for d in sleeps)
