@@ -1,10 +1,14 @@
 # -*- coding: utf-8 -*-
 """Учёт блокировок воркером: две полосы пауз (обход; выдача и подбор), бан сразу,
 серия сбоев загрузки, уровень и пауза полосы в памяти процесса, сброс профиля
-и устройства у сессии потока, пробная задача после паузы обхода."""
+и устройства у сессии потока, пробная задача после паузы обхода. Приоритет очередей:
+сначала обход. Простой браузера выдачи проверяется после каждой задачи. Серия сбоев
+загрузки при недоступном Ozon названа в причине бана блокировкой IP."""
 import time
+import pytest
 from types import SimpleNamespace
 
+import app.worker.consumer as consumer_module
 from app.core.exceptions import AntibotBlockedError, PageLoadError, ProductNotFoundError
 from app.marketplaces.ozon.service import CRAWL, SEARCH
 from app.worker.consumer import LANE_BY_STREAM, SESSION_BY_STREAM, LaneState, TaskConsumer
@@ -13,19 +17,25 @@ from app.worker.redis_config import redis_worker_settings as rws
 
 HOUR = 3600.0
 POLICY = SimpleNamespace(load_failure_threshold=3, ban_pause_start_s=600.0,
-                         ban_pause_max_s=2 * HOUR, ban_level_reset_s=6 * HOUR)
+                         ban_pause_max_s=2 * HOUR, ban_level_reset_s=6 * HOUR,
+                         search_idle_close_s=900.0)
 
 
 class FakeService:
     def __init__(self):
         self.generations = []
         self.resets = []
+        self.idle_checks = []
 
     def set_device_generation(self, generation, session=None):
         self.generations.append((generation, session))
 
     def reset_profile(self, session=None):
         self.resets.append(session)
+
+    def close_search_if_idle(self, idle_s):
+        self.idle_checks.append(idle_s)
+        return False
 
 
 class FakeRedis:
@@ -43,6 +53,12 @@ class FakeRedis:
         return None
 
 
+@pytest.fixture(autouse=True)
+def _ozon_reachable_in_tests(monkeypatch):
+    """Тесты не ходят в сеть: по умолчанию Ozon «доступен»."""
+    monkeypatch.setattr(consumer_module, "_ozon_reachable", lambda timeout_s=10.0: True)
+
+
 def make_consumer():
     consumer = TaskConsumer.__new__(TaskConsumer)
     consumer._policy = POLICY
@@ -51,6 +67,7 @@ def make_consumer():
     consumer._search_paused = False
     consumer._probe_pending = False
     consumer._generations = {CRAWL: 0, SEARCH: 0}
+    consumer._task_keys = consumer_module._keys_crawl_first(rws.task_keys, rws.parse_task_keys)
     consumer.service = FakeService()
     return consumer
 
@@ -151,6 +168,31 @@ def _queues():
             rws.parse_tasks_key("ozon"): ["{}"]}
 
 
+def test_crawl_queue_first():
+    """Очереди по приоритету: сначала обход, затем остальные в прежнем порядке."""
+    keys = consumer_module._keys_crawl_first(
+        ["select:tasks:ozon:spb", "search:tasks:ozon:spb", "parse:tasks:ozon:spb"],
+        ["parse:tasks:ozon:spb"])
+    assert keys == ["parse:tasks:ozon:spb", "select:tasks:ozon:spb", "search:tasks:ozon:spb"]
+
+
+def test_crawl_task_taken_before_select_and_search():
+    """Все очереди непустые — воркер берёт задачу обхода."""
+    consumer = make_consumer()
+    consumer.redis = FakeRedis(_queues())
+    assert _one_iteration(consumer) == [rws.parse_tasks_key("ozon")]
+    assert consumer.redis.calls == [consumer._task_keys]
+
+
+def test_select_taken_when_crawl_queue_empty():
+    """Очередь обхода пуста — берётся подбор (следующий по приоритету)."""
+    consumer = make_consumer()
+    queues = _queues()
+    queues[rws.parse_tasks_key("ozon")] = []
+    consumer.redis = FakeRedis(queues)
+    assert _one_iteration(consumer) == [rws.select_tasks_key("ozon")]
+
+
 def test_search_lane_paused_takes_only_parse():
     consumer = make_consumer()
     consumer.redis = FakeRedis(_queues())
@@ -159,13 +201,23 @@ def test_search_lane_paused_takes_only_parse():
     assert consumer.redis.calls == [rws.parse_task_keys]
 
 
-def test_search_lane_pause_end_restores_priority():
+def test_search_lane_pause_end_restores_all_queues():
+    """Пауза выдачи и подбора кончилась — снова слушаются все очереди (обход первым)."""
     consumer = make_consumer()
     consumer.redis = FakeRedis(_queues())
     consumer._lanes[SEARCH].until = time.time() - 1
     consumer._search_paused = True
-    assert _one_iteration(consumer) == [rws.select_tasks_key("ozon")]
+    assert _one_iteration(consumer) == [rws.parse_tasks_key("ozon")]
+    assert consumer.redis.calls == [consumer._task_keys]
     assert consumer._search_paused is False
+
+
+def test_idle_search_checked_after_each_task():
+    """После задачи цикл проверяет простой браузера выдачи с порогом из настроек."""
+    consumer = make_consumer()
+    consumer.redis = FakeRedis(_queues())
+    _one_iteration(consumer)
+    assert consumer.service.idle_checks == [POLICY.search_idle_close_s]
 
 
 def test_probe_task_after_crawl_pause_from_parse_queue():
@@ -183,8 +235,6 @@ def test_crawl_pause_end_makes_next_task_probe():
     assert consumer._probe_pending is True
 
 
-
-
 def test_ban_passes_session_of_blocked_browser():
     """Капча на плитках подбора: в регистрацию бана уходит сессия выдачи (смена
     устройства и профиля выдачи); без пометки - сессия не задана."""
@@ -194,3 +244,23 @@ def test_ban_passes_session_of_blocked_browser():
     consumer._track_failure("ban", "select", "search")
     consumer._track_failure("ban", "select")
     assert sessions == ["search", None]
+
+
+def test_ban_reason_names_ip_block_when_ozon_unreachable(monkeypatch):
+    """Серия сбоев загрузки и нет соединения с Ozon — в причине бана прямо: блокировка IP."""
+    monkeypatch.setattr(consumer_module, "_ozon_reachable", lambda timeout_s=10.0: False)
+    consumer = make_consumer()
+    reasons = []
+    consumer._register_ban = lambda lane, stream, reason, session=None: reasons.append(reason)
+    for _ in range(consumer._policy.load_failure_threshold):
+        consumer._track_failure("load", "parse")
+    assert len(reasons) == 1 and "Ozon не отвечает этому IP" in reasons[0]
+
+
+def test_ban_reason_plain_when_ozon_reachable():
+    consumer = make_consumer()
+    reasons = []
+    consumer._register_ban = lambda lane, stream, reason, session=None: reasons.append(reason)
+    for _ in range(consumer._policy.load_failure_threshold):
+        consumer._track_failure("load", "parse")
+    assert len(reasons) == 1 and "не отвечает этому IP" not in reasons[0]

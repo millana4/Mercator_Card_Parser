@@ -34,6 +34,7 @@ consumer.py — цикл потребления задач из Redis.
 Подключение к Redis отказоустойчивое: ждёт Redis и переживает его падения.
 """
 import json
+import socket
 import time
 import signal
 import random
@@ -58,6 +59,24 @@ LANE_BY_STREAM = {"parse": CRAWL, "search": SEARCH, "select": SEARCH}
 # устройство. Подбор идёт новыми браузерами с временным профилем — сбрасывать нечего.
 SESSION_BY_STREAM = {"parse": CRAWL, "search": SEARCH, "select": None}
 LANE_TITLE = {CRAWL: "обход", SEARCH: "выдача и подбор"}
+OZON_HOST = "www.ozon.ru"
+REACH_TIMEOUT_S = 10.0
+
+
+def _keys_crawl_first(task_keys, parse_keys) -> list[str]:
+    """Очереди по приоритету для BRPOP: сначала обход, затем остальные в прежнем порядке."""
+    parse = list(parse_keys)
+    return parse + [k for k in task_keys if k not in parse]
+
+
+def _ozon_reachable(timeout_s: float = REACH_TIMEOUT_S) -> bool:
+    """Устанавливается ли TCP-соединение с Ozon (порт 443). False — Ozon не отвечает
+    этому IP: блокировка на уровне сети или нет маршрута, браузер ни при чём."""
+    try:
+        with socket.create_connection((OZON_HOST, 443), timeout=timeout_s):
+            return True
+    except OSError:
+        return False
 
 
 @dataclass
@@ -70,7 +89,8 @@ class LaneState:
 
 class TaskConsumer:
     def __init__(self):
-        # Две долгоживущие сессии браузера: обход и выдача; подбор — новыми браузерами.
+        # Две долгоживущие сессии браузера: обход и выдача (снимки выдачи и плитки
+        # подбора); карточки подбора — свой браузер на время задачи.
         self.service = OzonService(use_session=True)
         self.producer = ResultProducer()
         self.redis = None               # подключим в run(), с повторами
@@ -84,6 +104,9 @@ class TaskConsumer:
         self._policy = self.service.policy
         # Ключ задачи -> (поток, маркетплейс). Считаем один раз при старте.
         self._routes = rws.key_routes
+        # Порядок очередей для BRPOP (Redis отдаёт из первого непустого ключа):
+        # сначала обход — основной сценарий, затем выдача и подбор.
+        self._task_keys = _keys_crawl_first(rws.task_keys, rws.parse_task_keys)
 
     def stop(self, *_):
         logger.info("Сигнал остановки — завершаю после текущей задачи")
@@ -102,8 +125,8 @@ class TaskConsumer:
                     socket_connect_timeout=10,
                 )
                 client.ping()
-                logger.info("TaskConsumer подключён к Redis %s:%s | ключи=%s (попытка %s)",
-                            rws.host, rws.port, rws.task_keys, attempt)
+                logger.info("TaskConsumer подключён к Redis %s:%s | ключи по приоритету=%s (попытка %s)",
+                            rws.host, rws.port, self._task_keys, attempt)
                 return client
             except Exception as e:
                 logger.warning("Redis недоступен (%s:%s): %s — жду, попытка %s",
@@ -152,17 +175,20 @@ class TaskConsumer:
                 self._interruptible_sleep(RESERVE_POLL_S)
                 continue  # резерв без сигнала — задачи не берём
             # BRPOP блокируется до задачи или таймаута; таймаут → проверяем _running.
-            # Список ключей: Redis отдаёт из первого непустого (приоритет select).
+            # Список ключей: Redis отдаёт из первого непустого (приоритет обхода).
             # Только очередь обхода: резерв, пробная задача после паузы обхода
             # или выдача и подбор на паузе.
             parse_only = rws.is_reserve or self._probe_pending or self._search_lane_paused()
-            keys = rws.parse_task_keys if parse_only else rws.task_keys
+            keys = rws.parse_task_keys if parse_only else self._task_keys
             popped = self.redis.brpop(keys, timeout=rws.brpop_timeout_s)
             if popped is None:
+                self.service.close_search_if_idle(self._policy.search_idle_close_s)
                 continue  # таймаут — задач нет, проверяем флаг и ждём дальше
             key, raw = popped
             self._probe_pending = False  # пробная задача взята; новый бан снова её назначит
             self._process_one(key, raw)
+            # браузер выдачи без задач выдачи и подбора дольше OZON_SEARCH_IDLE_CLOSE_S — закрыть
+            self.service.close_search_if_idle(self._policy.search_idle_close_s)
 
     def _process_one(self, key: str, raw: str) -> None:
         route = self._routes.get(key)
@@ -240,8 +266,12 @@ class TaskConsumer:
             logger.warning("Сбой загрузки подряд (%s): %s/%s",
                            LANE_TITLE[lane], state.load_failures, threshold)
             if state.load_failures >= threshold:
-                self._register_ban(lane, stream, f"сбоев загрузки подряд: {state.load_failures}",
-                                   session)
+                reason = f"сбоев загрузки подряд: {state.load_failures}"
+                if not _ozon_reachable():
+                    reason += ("; соединение с www.ozon.ru:443 не устанавливается — Ozon не "
+                               "отвечает этому IP (блокировка на уровне сети: смена устройства "
+                               "и профиля не поможет, ждём снятия блокировки)")
+                self._register_ban(lane, stream, reason, session)
         else:
             state.load_failures = 0
 

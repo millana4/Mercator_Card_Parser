@@ -335,6 +335,16 @@ class OzonParser:
         except Exception as e:
             logger.warning("Не удалось открыть главную (сессия всё равно продолжится): %s", e)
 
+    def leave_to_home(self) -> None:
+        """Уйти с текущей страницы на главную Ozon, не закрывая браузер: тяжёлая
+        прокрученная выдача выгружается из памяти, профиль и кука остаются."""
+        try:
+            self.driver.set_page_load_timeout(self.policy.page_load_timeout)
+            self.driver.get("https://www.ozon.ru/")
+            logger.info("Ушёл с выдачи на главную Ozon (браузер остаётся открытым)")
+        except Exception as e:
+            logger.warning("Не удалось уйти на главную Ozon: %s", e)
+
     def _navigate_within_ozon(self, url: str) -> None:
         """Перейти на карточку КАК живой пользователь — через window.location
         со страницы Ozon, чтобы браузер сам проставил Referer=ozon.ru.

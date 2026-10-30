@@ -123,6 +123,7 @@ class OzonService:
         self.use_session = use_session
         self._crawl_parser = None       # долгоживущий парсер сессии обхода
         self._search_parser = None      # долгоживущий парсер сессии выдачи
+        self._search_used_at = 0.0      # monotonic: конец последней задачи выдачи или подбора
         self._lock = threading.RLock()  # браузеры - вызовы по очереди
         self._sleep = time.sleep        # пауза между переходами подбора
         # Поколение устройства браузера по сессиям (растёт при бане своей сессии)
@@ -596,8 +597,34 @@ class OzonService:
             raise self._browser_failure(SEARCH, parser, e, page_url) from e
         finally:
             parser.consume_session_step()
+            self._search_used_at = time.monotonic()
         return {"raw_tiles": raw_tiles, "scrolls": scrolls, "html": html,
                 "url": page_url, "screenshot_png": png}
+
+    def close_search_if_idle(self, idle_s: float) -> bool:
+        """Закрыть браузер сессии выдачи, если задач выдачи и подбора не было idle_s
+        секунд. Профиль с кукой остаётся на диске: следующая задача откроет браузер
+        с ним же (через главную Ozon). idle_s <= 0 — не закрывать."""
+        with self._lock:
+            if self._search_parser is None or idle_s <= 0:
+                return False
+            idle = time.monotonic() - self._search_used_at
+            if idle < idle_s:
+                return False
+            logger.info("Сессия выдачи без задач %.0f мин — закрываю браузер "
+                        "(профиль с кукой остаётся)", idle / 60)
+            self._close_session(SEARCH)
+            return True
+
+    def _leave_listing(self, parser) -> None:
+        """После подбора: сессия выдачи уходит с прокрученной выдачи на главную
+        (выдача выгружается из памяти), браузер остаётся открытым."""
+        if parser is None or parser is not self._search_parser:
+            return  # сессию уже закрыли (капча, сбой)
+        try:
+            parser.leave_to_home()
+        finally:
+            parser.consume_session_step()
 
     def search_tiles(self, query: str, target: int | None = None, save_files: bool = True) -> dict:
         """Снимок выдачи: плитки с позициями, в карточки не заходим.
@@ -732,6 +759,8 @@ class OzonService:
                 )
             finally:
                 browsers.close_all()
+                self._leave_listing(listing["parser"])
+                self._search_used_at = time.monotonic()
 
 
 class _SelectBrowsers:

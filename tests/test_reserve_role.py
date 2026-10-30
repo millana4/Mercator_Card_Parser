@@ -1,5 +1,6 @@
 # -*- coding: utf-8 -*-
-"""Роль reserve: задачи обхода только по сигналу ядра; primary сигнал не смотрит."""
+"""Роль reserve: задачи обхода только по сигналу ядра; primary сигнал не смотрит
+и слушает все очереди (обход первым)."""
 from types import SimpleNamespace
 
 from app.marketplaces.ozon.service import CRAWL, SEARCH
@@ -8,7 +9,15 @@ from app.worker.consumer import LaneState, TaskConsumer
 from app.worker.redis_config import redis_worker_settings as rws
 
 POLICY = SimpleNamespace(load_failure_threshold=3, ban_pause_start_s=600.0,
-                         ban_pause_max_s=7200.0, ban_level_reset_s=21600.0)
+                         ban_pause_max_s=7200.0, ban_level_reset_s=21600.0,
+                         search_idle_close_s=900.0)
+
+
+class FakeService:
+    """Сервис без браузеров: цикл воркера после задачи проверяет простой выдачи."""
+
+    def close_search_if_idle(self, idle_s):
+        return False
 
 
 class FakeRedis:
@@ -39,6 +48,8 @@ def make_consumer(redis):
     c._reserve_active = False
     c._probe_pending = False
     c._generations = {CRAWL: 0, SEARCH: 0}
+    c._task_keys = consumer_module._keys_crawl_first(rws.task_keys, rws.parse_task_keys)
+    c.service = FakeService()
     c.redis = redis
     return c
 
@@ -86,15 +97,17 @@ def test_reserve_with_signal_takes_only_parse(monkeypatch):
     c = make_consumer(redis)
     taken, _ = _run_until_task(c)
     assert taken == [rws.parse_tasks_key("ozon")]
-    assert redis.brpop_calls == [rws.parse_task_keys]
+    assert redis.brpop_calls == [rws.parse_task_keys]   # резерв слушает только обход
     assert c._reserve_active is True
 
 
 def test_primary_ignores_signal(monkeypatch):
     monkeypatch.setattr(rws, "role", "primary")
     redis = FakeRedis(_queues(), signal=False)
-    taken, _ = _run_until_task(make_consumer(redis))
-    assert taken == [rws.select_tasks_key("ozon")]       # обычный приоритет
+    c = make_consumer(redis)
+    taken, _ = _run_until_task(c)
+    assert taken == [rws.parse_tasks_key("ozon")]        # обход первым
+    assert redis.brpop_calls == [c._task_keys]           # слушает все очереди
     assert redis.exists_calls == []
 
 

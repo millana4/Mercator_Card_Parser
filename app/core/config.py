@@ -80,6 +80,7 @@ class MarketplacePolicy:
     search_max_scrolls: int = 10        # снимок выдачи: потолок прокруток
     full_content_timeout: float = 15.0  # сек: сколько ждать полный блок характеристик при полном разборе
     search_task_max_age_s: float = 21600.0  # сек: задача выдачи старше (от run_at) не выполняется
+    search_idle_close_s: float = 900.0  # сек: браузер выдачи без задач выдачи и подбора столько — закрывается (профиль остаётся)
     # Переключатели подмен отпечатка (опыт по одной; по умолчанию — как сейчас)
     fp_webgl: str = "spoof"             # spoof — WebGL + строка видеокарты профиля; native — WebGL без подмены; off — WebGL выключен
     fp_tostring_proxy: bool = True      # Proxy на Function.prototype.toString (подмены выглядят встроенными)
@@ -116,6 +117,7 @@ class Settings:
             ban_pause_start_s=_get_float("OZON_BAN_PAUSE_START_S", 600.0),
             ban_pause_max_s=_get_float("OZON_BAN_PAUSE_MAX_S", 7200.0),
             ban_level_reset_s=_get_float("OZON_BAN_LEVEL_RESET_S", 21600.0),
+            search_idle_close_s=_get_float("OZON_SEARCH_IDLE_CLOSE_S", 900.0),
             block_artifacts_keep=_get_int("OZON_BLOCK_ARTIFACTS_KEEP", 50),
             session_min=_get_int("OZON_SESSION_MIN", 20),
             session_max=_get_int("OZON_SESSION_MAX", 50),

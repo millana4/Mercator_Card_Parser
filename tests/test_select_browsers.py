@@ -62,6 +62,9 @@ class FakeParser:
         self.actions.append(("scroll", want))
         return RAW_TILES, 1
 
+    def leave_to_home(self):
+        self.actions.append("leave")
+
     def fetch_html_in_session(self, url, full_content=False):
         if FakeParser.fail_on_card is not None:
             raise FakeParser.fail_on_card
@@ -126,8 +129,9 @@ def test_tiles_in_search_session_cards_in_own_browser(env, monkeypatch):
     search, cards = FakeParser.created
     assert service._search_parser is search                    # плитки - в сессии выдачи
     assert search.profile_dir == str(search_dir) and cards.profile_dir == str(cards_dir)
-    # выдача открыта один раз, дальше - только прокрутка той же выдачи
-    assert search.actions == ["home", ("listing", SEARCH_URL, 0), ("scroll", 32), ("scroll", 30)]
+    # выдача открыта один раз, дальше - прокрутка; после задачи - уход на главную
+    assert search.actions == ["home", ("listing", SEARCH_URL, 0), ("scroll", 32), ("scroll", 30),
+                              "leave"]
     assert cards.actions == ["home", ("card", "c1", True), ("card", "c2", True)]
     assert cards.closed and not search.closed                  # сессия выдачи остаётся открытой
     assert service._crawl_parser is None
@@ -140,9 +144,22 @@ def test_search_session_reused_by_next_select(env, monkeypatch):
     _run(service, monkeypatch, [("load", set(), 32)])
     _run(service, monkeypatch, [("load", set(), 32)])
     search = service._search_parser
-    assert search.actions == ["home", ("listing", SEARCH_URL, 0), ("scroll", 32),
-                              ("listing", SEARCH_URL, 0), ("scroll", 32)]
+    assert search.actions == ["home", ("listing", SEARCH_URL, 0), ("scroll", 32), "leave",
+                              ("listing", SEARCH_URL, 0), ("scroll", 32), "leave"]
     assert len(FakeParser.created) == 1                        # карточки не открывались
+
+
+def test_search_browser_closed_after_idle_profile_kept(env, monkeypatch):
+    """Браузер выдачи без задач дольше порога закрывается; профиль с кукой остаётся."""
+    service, search_dir, _ = env
+    _run(service, monkeypatch, [("load", set(), 32)])
+    search = service._search_parser
+    assert service.close_search_if_idle(900) is False          # только что работал
+    service._search_used_at -= 901
+    assert service.close_search_if_idle(900) is True
+    assert search.closed and service._search_parser is None
+    assert os.listdir(search_dir) == ["Cookies"]
+    assert service.close_search_if_idle(900) is False          # закрывать уже нечего
 
 
 def test_candidates_read_from_rendered_tiles_without_known(env, monkeypatch):
