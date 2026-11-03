@@ -75,6 +75,8 @@ class OzonCard(BaseModel):
     # Идентификация
     sku: str | None = Field(None, description="Артикул товара")
     url: str | None = Field(None, description="URL карточки")
+    image_url: str | None = Field(
+        None, description="Главное фото карточки (og:image, вариант 600 px); None — фото не найдено")
     parsed_at: str | None = Field(None, description="Дата и время парсинга (ISO)")
     name: str | None = Field(None, description="Наименование товара")
     brand: str | None = Field(None, description="Бренд")

@@ -559,6 +559,41 @@ def _strip_query(url: str | None) -> str | None:
     return url.split("?", 1)[0]
 
 
+# Главное фото: meta og:image (Ozon отдаёт вариант 600 px), запасной источник —
+# image из товарного JSON-LD. Фото товара лежат в /multimedia…/; всё остальное
+# (логотип Ozon на странице поиска, куда уводит закончившийся товар) отбрасываем.
+_OG_IMAGE_TAG = re.compile(r'<meta\b[^>]*?\bproperty="og:image"[^>]*>', re.IGNORECASE)
+_CONTENT_ATTR = re.compile(r'\bcontent="([^"]*)"', re.IGNORECASE)
+
+
+def _product_image(url) -> str | None:
+    """Адрес фото товара или None, если это не фото товара."""
+    if isinstance(url, dict):
+        url = url.get("url") or url.get("contentUrl")
+    if not isinstance(url, str):
+        return None
+    url = htmllib.unescape(url.strip())
+    if url.startswith("//"):
+        url = "https:" + url
+    if not url.startswith("http") or "/multimedia" not in url:
+        return None
+    return url
+
+
+def _extract_image_url(html: str | None, nuxt: dict | None) -> str | None:
+    """Адрес главного фото карточки: og:image, иначе image из JSON-LD, иначе None."""
+    for tag in _OG_IMAGE_TAG.findall(html or ""):
+        m = _CONTENT_ATTR.search(tag)
+        url = _product_image(m.group(1)) if m else None
+        if url:
+            return url
+    ld = _ld_json(nuxt)
+    image = ld.get("image") if ld else None
+    if isinstance(image, list):
+        image = image[0] if image else None
+    return _product_image(image)
+
+
 def _extract_location(nuxt: dict | None) -> OzonLocation:
     """
     Регион выдачи из location.current сырого состояния.
@@ -643,6 +678,7 @@ def build_card(html: str, nuxt_state: dict | None, url: str | None = None) -> Oz
     card = OzonCard(
         sku=sku,
         url=canonical,
+        image_url=_extract_image_url(html, nuxt_state),
         parsed_at=datetime.now(timezone.utc).isoformat(timespec="seconds"),
         name=_extract_name(html, nuxt_state),
         brand=_extract_brand(html, nuxt_state),
