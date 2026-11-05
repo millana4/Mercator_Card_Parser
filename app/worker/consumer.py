@@ -63,10 +63,27 @@ OZON_HOST = "www.ozon.ru"
 REACH_TIMEOUT_S = 10.0
 
 
-def _keys_crawl_first(task_keys, parse_keys) -> list[str]:
-    """Очереди по приоритету для BRPOP: сначала обход, затем остальные в прежнем порядке."""
-    parse = list(parse_keys)
-    return parse + [k for k in task_keys if k not in parse]
+def _queue_order(task_keys, routes, select_turn: bool) -> list[str]:
+    """Очереди по приоритету для BRPOP (Redis отдаёт из первого непустого ключа).
+    Обычно: обход, подбор, выдача. Подбор берётся, когда очередь обхода пуста.
+    select_turn (после N задач обхода подряд): подбор, обход, выдача.
+    Выдача всегда последняя: её берут, только когда пусты и обход, и подбор."""
+    by_stream: dict[str, list[str]] = {}
+    for key in task_keys:
+        by_stream.setdefault(routes[key][0], []).append(key)
+    order = ("select", "parse", "search") if select_turn else ("parse", "select", "search")
+    order += tuple(stream for stream in by_stream if stream not in order)
+    return [key for stream in order for key in by_stream.get(stream, [])]
+
+
+def _keys_for_next_task(parse_streak: int, select_every: int, normal_keys, turn_keys) -> list[str]:
+    """Очереди для следующего BRPOP. Обычно - normal_keys (обход первым); после select_every
+    задач обхода подряд - turn_keys (подбор первым): есть задача подбора - берём её,
+    нет - Redis отдаст обход. select_every <= 0 - очередь подбора не ждёт своего хода.
+    Ядро постоянно держит очередь обхода непустой, без этого подбор не брался бы никогда."""
+    if select_every > 0 and parse_streak >= select_every:
+        return list(turn_keys)
+    return list(normal_keys)
 
 
 def _ozon_reachable(timeout_s: float = REACH_TIMEOUT_S) -> bool:
@@ -105,8 +122,10 @@ class TaskConsumer:
         # Ключ задачи -> (поток, маркетплейс). Считаем один раз при старте.
         self._routes = rws.key_routes
         # Порядок очередей для BRPOP (Redis отдаёт из первого непустого ключа):
-        # сначала обход — основной сценарий, затем выдача и подбор.
-        self._task_keys = _keys_crawl_first(rws.task_keys, rws.parse_task_keys)
+        # обычно обход, подбор, выдача; после N задач обхода подряд - подбор, обход, выдача.
+        self._task_keys = _queue_order(rws.task_keys, self._routes, select_turn=False)
+        self._turn_keys = _queue_order(rws.task_keys, self._routes, select_turn=True)
+        self._parse_streak = 0          # задач обхода подряд с последней задачи подбора или выдачи
 
     def stop(self, *_):
         logger.info("Сигнал остановки — завершаю после текущей задачи")
@@ -179,13 +198,21 @@ class TaskConsumer:
             # Только очередь обхода: резерв, пробная задача после паузы обхода
             # или выдача и подбор на паузе.
             parse_only = rws.is_reserve or self._probe_pending or self._search_lane_paused()
-            keys = rws.parse_task_keys if parse_only else self._task_keys
+            keys = (rws.parse_task_keys if parse_only else
+                    _keys_for_next_task(self._parse_streak, self._policy.crawl_between_select,
+                                        self._task_keys, self._turn_keys))
             popped = self.redis.brpop(keys, timeout=rws.brpop_timeout_s)
             if popped is None:
                 self.service.close_search_if_idle(self._policy.search_idle_close_s)
                 continue  # таймаут — задач нет, проверяем флаг и ждём дальше
             key, raw = popped
             self._probe_pending = False  # пробная задача взята; новый бан снова её назначит
+            stream = rws.key_routes[key][0]
+            if stream == "parse":
+                self._parse_streak += 1
+            elif stream == "select":
+                logger.info("Подбор после %s задач обхода подряд: беру %s", self._parse_streak, key)
+                self._parse_streak = 0
             self._process_one(key, raw)
             # браузер выдачи без задач выдачи и подбора дольше OZON_SEARCH_IDLE_CLOSE_S — закрыть
             self.service.close_search_if_idle(self._policy.search_idle_close_s)

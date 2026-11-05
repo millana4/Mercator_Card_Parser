@@ -10,7 +10,7 @@ from app.worker.redis_config import redis_worker_settings as rws
 
 POLICY = SimpleNamespace(load_failure_threshold=3, ban_pause_start_s=600.0,
                          ban_pause_max_s=7200.0, ban_level_reset_s=21600.0,
-                         search_idle_close_s=900.0)
+                         search_idle_close_s=900.0, crawl_between_select=20)
 
 
 class FakeService:
@@ -48,7 +48,9 @@ def make_consumer(redis):
     c._reserve_active = False
     c._probe_pending = False
     c._generations = {CRAWL: 0, SEARCH: 0}
-    c._task_keys = consumer_module._keys_crawl_first(rws.task_keys, rws.parse_task_keys)
+    c._task_keys = consumer_module._queue_order(rws.task_keys, rws.key_routes, select_turn=False)
+    c._turn_keys = consumer_module._queue_order(rws.task_keys, rws.key_routes, select_turn=True)
+    c._parse_streak = 0
     c.service = FakeService()
     c.redis = redis
     return c

@@ -18,7 +18,7 @@ from app.worker.redis_config import redis_worker_settings as rws
 HOUR = 3600.0
 POLICY = SimpleNamespace(load_failure_threshold=3, ban_pause_start_s=600.0,
                          ban_pause_max_s=2 * HOUR, ban_level_reset_s=6 * HOUR,
-                         search_idle_close_s=900.0)
+                         search_idle_close_s=900.0,  crawl_between_select=20)
 
 
 class FakeService:
@@ -67,7 +67,9 @@ def make_consumer():
     consumer._search_paused = False
     consumer._probe_pending = False
     consumer._generations = {CRAWL: 0, SEARCH: 0}
-    consumer._task_keys = consumer_module._keys_crawl_first(rws.task_keys, rws.parse_task_keys)
+    consumer._task_keys = consumer_module._queue_order(rws.task_keys, rws.key_routes, select_turn=False)
+    consumer._turn_keys = consumer_module._queue_order(rws.task_keys, rws.key_routes, select_turn=True)
+    consumer._parse_streak = 0
     consumer.service = FakeService()
     return consumer
 
@@ -168,12 +170,12 @@ def _queues():
             rws.parse_tasks_key("ozon"): ["{}"]}
 
 
-def test_crawl_queue_first():
-    """Очереди по приоритету: сначала обход, затем остальные в прежнем порядке."""
-    keys = consumer_module._keys_crawl_first(
-        ["select:tasks:ozon:spb", "search:tasks:ozon:spb", "parse:tasks:ozon:spb"],
-        ["parse:tasks:ozon:spb"])
-    assert keys == ["parse:tasks:ozon:spb", "select:tasks:ozon:spb", "search:tasks:ozon:spb"]
+def test_queue_order():
+    """Обычно обход, подбор, выдача; в ход подбора - подбор, обход, выдача. Выдача всегда последняя."""
+    routes = {"sel": ("select", "ozon"), "srch": ("search", "ozon"), "par": ("parse", "ozon")}
+    keys = ["sel", "srch", "par"]
+    assert consumer_module._queue_order(keys, routes, select_turn=False) == ["par", "sel", "srch"]
+    assert consumer_module._queue_order(keys, routes, select_turn=True) == ["sel", "par", "srch"]
 
 
 def test_crawl_task_taken_before_select_and_search():
@@ -182,6 +184,93 @@ def test_crawl_task_taken_before_select_and_search():
     consumer.redis = FakeRedis(_queues())
     assert _one_iteration(consumer) == [rws.parse_tasks_key("ozon")]
     assert consumer.redis.calls == [consumer._task_keys]
+
+
+def test_keys_for_next_task():
+    """До порога - обход первым; на пороге - подбор и выдача первыми; 0 - порог выключен."""
+    all_keys = ["select", "search", "parse"]
+    crawl_first = ["parse", "select", "search"]
+    assert consumer_module._keys_for_next_task(0, 20, crawl_first, all_keys) == crawl_first
+    assert consumer_module._keys_for_next_task(19, 20, crawl_first, all_keys) == crawl_first
+    assert consumer_module._keys_for_next_task(20, 20, crawl_first, all_keys) == all_keys
+    assert consumer_module._keys_for_next_task(500, 0, crawl_first, all_keys) == crawl_first
+
+
+def test_select_turn_after_n_crawl_tasks():
+    """Очередь обхода непустая, но после N задач обхода берётся подбор; счётчик обнуляется."""
+    consumer = make_consumer()
+    consumer._parse_streak = POLICY.crawl_between_select
+    consumer.redis = FakeRedis(_queues())
+    assert _one_iteration(consumer) == [rws.select_tasks_key("ozon")]
+    assert consumer.redis.calls == [consumer._turn_keys]
+    assert consumer._parse_streak == 0
+
+
+def test_select_turn_without_select_tasks_falls_back_to_crawl():
+    """Подбора и выдачи нет - берётся обход, и очерёдность подбора не теряется."""
+    consumer = make_consumer()
+    consumer._parse_streak = POLICY.crawl_between_select
+    queues = _queues()
+    queues[rws.select_tasks_key("ozon")] = []
+    queues[rws.search_tasks_key("ozon")] = []
+    consumer.redis = FakeRedis(queues)
+    assert _one_iteration(consumer) == [rws.parse_tasks_key("ozon")]
+    assert consumer._parse_streak == POLICY.crawl_between_select + 1
+
+
+def test_crawl_tasks_counted_in_streak():
+    consumer = make_consumer()
+    consumer.redis = FakeRedis(_queues())
+    assert _one_iteration(consumer) == [rws.parse_tasks_key("ozon")]
+    assert consumer._parse_streak == 1
+
+
+def test_search_taken_only_when_crawl_and_select_empty():
+    """Выдача последняя: берётся, только когда пусты и обход, и подбор."""
+    consumer = make_consumer()
+    queues = _queues()
+    queues[rws.parse_tasks_key("ozon")] = []
+    consumer.redis = FakeRedis(queues)
+    assert _one_iteration(consumer) == [rws.select_tasks_key("ozon")]     # подбор раньше выдачи
+
+    consumer = make_consumer()
+    queues = _queues()
+    queues[rws.parse_tasks_key("ozon")] = []
+    queues[rws.select_tasks_key("ozon")] = []
+    consumer.redis = FakeRedis(queues)
+    assert _one_iteration(consumer) == [rws.search_tasks_key("ozon")]
+
+
+def test_select_turn_without_select_prefers_crawl_over_search():
+    """Ход подбора, а подбора нет: берётся обход, а не выдача."""
+    consumer = make_consumer()
+    consumer._parse_streak = POLICY.crawl_between_select
+    queues = _queues()
+    queues[rws.select_tasks_key("ozon")] = []
+    consumer.redis = FakeRedis(queues)
+    assert _one_iteration(consumer) == [rws.parse_tasks_key("ozon")]
+
+
+def test_select_resets_streak_even_when_taken_without_turn():
+    """Подбор взят при пустом обходе: до следующего хода снова нужно N задач обхода."""
+    consumer = make_consumer()
+    consumer._parse_streak = 5
+    queues = _queues()
+    queues[rws.parse_tasks_key("ozon")] = []
+    consumer.redis = FakeRedis(queues)
+    assert _one_iteration(consumer) == [rws.select_tasks_key("ozon")]
+    assert consumer._parse_streak == 0
+
+
+def test_search_does_not_reset_streak():
+    consumer = make_consumer()
+    consumer._parse_streak = 5
+    queues = _queues()
+    queues[rws.parse_tasks_key("ozon")] = []
+    queues[rws.select_tasks_key("ozon")] = []
+    consumer.redis = FakeRedis(queues)
+    assert _one_iteration(consumer) == [rws.search_tasks_key("ozon")]
+    assert consumer._parse_streak == 5
 
 
 def test_select_taken_when_crawl_queue_empty():

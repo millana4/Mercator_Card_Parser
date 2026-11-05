@@ -36,6 +36,16 @@ def handle_select(task: dict, service: OzonService) -> dict:
                 echo["task_id"], echo["set_id"], echo["stratum_id"],
                 task.get("category"), task.get("query"), task.get("count"),
                 len(task.get("priority_skus") or []))
+    # Задача могла долго стоять в очереди (парсеры были заняты): создана давно - не выполняем,
+    # ядро получит expired и отправит страту заново. Нет created_at - срок не проверяется.
+    max_age = getattr(getattr(service, "policy", None), "select_task_max_age_s", None)
+    age = _task_age_s(task.get("created_at"))
+    if max_age and age is not None and age > max_age:
+        logger.info("SELECT задача устарела (%.1f ч от created_at) — пропускаю | task_id=%s query=%r",
+                    age / 3600, echo["task_id"], task.get("query"))
+        return {**echo, "ok": False, "requested_count": task.get("count"), "found_count": 0,
+                "cards": [], "error": f"Задача подбора устарела: {age / 3600:.1f} ч от created_at",
+                "error_code": "expired", "_failure": "expired"}
     try:
         req = _build_stratum_request(task)
         result = service.select_for_stratum(req)
