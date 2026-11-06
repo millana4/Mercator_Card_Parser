@@ -164,6 +164,12 @@ def _norm_space(text: str) -> str:
     return re.sub(r"\s+", " ", text).strip()
 
 
+def _clean_key(key: str) -> str:
+    """Название характеристики без завершающего двоеточия и лишних пробелов:
+    у части товаров Ozon пишет «Рисунок:» вместо «Рисунок»."""
+    return _norm_space(key).rstrip(":").rstrip()
+
+
 def _collect_widget(html: str, widget: str) -> _WidgetCollector | None:
     """
     Разобрать разметку первого виджета data-widget="<widget>".
@@ -379,7 +385,7 @@ def _extract_characteristics(html: str) -> dict[str, str]:
     if not st:
         return out
     for ch in st.get("characteristics", []):
-        title = _rs_text(ch.get("title", {}).get("textRs", []))
+        title = _clean_key(_rs_text(ch.get("title", {}).get("textRs", [])))
         values = ch.get("values", [])
         # У значений бывает «висящая» запятая внутри text ("Вискоза, "),
         # поэтому сначала чистим каждый кусок, потом склеиваем через запятую.
@@ -406,7 +412,8 @@ def _extract_characteristics_full(html: str) -> dict[str, str]:
     out: dict[str, str] = {}
     if not collector:
         return out
-    for key, value in collector.pairs:
+    for raw_key, value in collector.pairs:
+        key = _clean_key(raw_key)
         if not key or not value:
             continue
         if key in out and out[key] != value:
