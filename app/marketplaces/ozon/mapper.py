@@ -300,11 +300,26 @@ def _extract_name(html: str, nuxt: dict | None) -> str | None:
     return None
 
 
+def _brand_name(value) -> str | None:
+    """Бренд из JSON-LD: строка, объект schema.org {'@type': 'Brand', 'name': ...}
+    или список таких значений (с 24.11.2026 Ozon отдаёт часть карточек объектом)."""
+    if isinstance(value, str):
+        return value.strip() or None
+    if isinstance(value, dict):
+        return _brand_name(value.get("name"))
+    if isinstance(value, list):
+        for item in value:
+            name = _brand_name(item)
+            if name:
+                return name
+    return None
+
+
 def _extract_brand(html: str, nuxt: dict | None) -> str | None:
     # Бренд надёжнее всего лежит в SEO JSON-LD (script[type=ld+json]).
     ld = _ld_json(nuxt)
     if ld and ld.get("brand"):
-        return ld["brand"]
+        return _brand_name(ld["brand"])
     return None
 
 
